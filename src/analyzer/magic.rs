@@ -1,0 +1,40 @@
+//! Magic byte detection for already-compressed/encrypted formats.
+
+/// Returns true if the data header matches a known non-compressible format.
+pub fn is_incompressible(data: &[u8]) -> bool {
+    if data.len() < 4 { return false; }
+    matches!(data,
+        // JPEG
+        [0xFF, 0xD8, 0xFF, ..] |
+        // PNG
+        [0x89, 0x50, 0x4E, 0x47, ..] |
+        // ZIP / DEFLATE-based
+        [0x50, 0x4B, 0x03, 0x04, ..] |
+        [0x50, 0x4B, 0x05, 0x06, ..] |
+        [0x50, 0x4B, 0x07, 0x08, ..] |
+        // gzip
+        [0x1F, 0x8B, ..] |
+        // zstd
+        [0x28, 0xB5, 0x2F, 0xFD, ..] |
+        // brotli (no standard magic, skip)
+        // LZ4
+        [0x04, 0x22, 0x4D, 0x18, ..] |
+        // 7-zip
+        [0x37, 0x7A, 0xBC, 0xAF, ..] |
+        // RAR
+        [0x52, 0x61, 0x72, 0x21, ..] |
+        // MP3
+        [0xFF, 0xFB, ..] |
+        [0xFF, 0xF3, ..] |
+        [0xFF, 0xF2, ..] |
+        [0x49, 0x44, 0x33, ..] |  // ID3
+        // MP4 / MOV (ftyp box)
+        [_, _, _, _, 0x66, 0x74, 0x79, 0x70, ..] |
+        // OGG
+        [0x4F, 0x67, 0x67, 0x53, ..] |
+        // WebP
+        [0x52, 0x49, 0x46, 0x46, ..] |
+        // FLAC
+        [0x66, 0x4C, 0x61, 0x43, ..]
+    )
+}

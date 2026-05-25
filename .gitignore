@@ -1,0 +1,27 @@
+# Rust build artifacts
+/target/
+
+# Cargo lock is committed for binaries
+# Cargo.lock
+
+# Corpus files (large / downloaded)
+/corpus/
+
+# Python experiment outputs
+experiments/__pycache__/
+experiments/*.pyc
+experiments/results/
+experiments/*.png
+experiments/*.csv
+experiments/*.log
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Dev notes
+dev.md
