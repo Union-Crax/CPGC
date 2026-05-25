@@ -11,7 +11,6 @@
 experiments/__pycache__/
 experiments/*.pyc
 experiments/results/
-experiments/*.png
 experiments/*.csv
 experiments/*.log
 
