@@ -111,6 +111,44 @@ impl Order4Model {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Order-5: P(next | prev5..prev1)  — sparse hashmap, capped size
+// ---------------------------------------------------------------------------
+
+const ORDER5_CAP: usize = 1 << 22; // 4M entries max
+
+pub struct Order5Model {
+    counts: HashMap<u64, Box<[u32; 256]>>,
+}
+
+impl Order5Model {
+    pub fn new() -> Self {
+        Self { counts: HashMap::new() }
+    }
+
+    pub fn predict(&self, ctx5: u64) -> [f32; 256] {
+        if let Some(row) = self.counts.get(&ctx5) {
+            let total: u32 = row.iter().sum();
+            let total_f = total as f32 + 256.0 * ALPHA;
+            let mut out = [0f32; 256];
+            for (i, &c) in row.iter().enumerate() {
+                out[i] = (c as f32 + ALPHA) / total_f;
+            }
+            out
+        } else {
+            [1.0 / 256.0; 256]
+        }
+    }
+
+    pub fn update(&mut self, ctx5: u64, next: u8) {
+        if self.counts.len() >= ORDER5_CAP {
+            return;
+        }
+        let row = self.counts.entry(ctx5).or_insert_with(|| Box::new([0u32; 256]));
+        row[next as usize] += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

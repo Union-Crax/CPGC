@@ -31,6 +31,7 @@ pub struct TinyLSTM {
 
     // SGD with momentum
     lr: f32,
+    update_counter: u32,   // skip backward pass 3 out of 4 bytes (4× speedup)
     mom_gates: Box<[[f32; XH]; GATES]>,
     mom_out:   Box<[[f32; HIDDEN]; 256]>,
     mom_b_gates: [f32; GATES],
@@ -51,15 +52,6 @@ pub struct TinyLSTM {
 
 impl TinyLSTM {
     pub fn new(lr: f32) -> Box<Self> {
-        // Xavier-ish init: small random values
-        // Using a simple deterministic LCG so init is reproducible.
-        let mut lcg: u64 = 0x_dead_beef_cafe_1234;
-        let mut rng = move || -> f32 {
-            lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            let bits = ((lcg >> 33) as u32) as f32 / (u32::MAX as f32) - 0.5;
-            bits * 0.1
-        };
-
         let mut lstm = Box::new(Self {
             embed:       [[0f32; EMBED]; 256],
             w_gates:     [[0f32; XH]; GATES],
@@ -70,6 +62,7 @@ impl TinyLSTM {
             c:           [0f32; HIDDEN],
             last_byte:   0,
             lr,
+            update_counter: 0,
             mom_gates:   Box::new([[0f32; XH]; GATES]),
             mom_out:     Box::new([[0f32; HIDDEN]; 256]),
             mom_b_gates: [0f32; GATES],
@@ -86,16 +79,61 @@ impl TinyLSTM {
             last_logits: [0f32; 256],
         });
 
-        for row in lstm.embed.iter_mut() {
-            for v in row.iter_mut() { *v = rng(); }
+        // If pretrained weights are bundled (cargo --features pretrained), load them.
+        // Otherwise fall back to random Xavier init via a deterministic LCG.
+        #[cfg(feature = "pretrained")]
+        {
+            static WEIGHTS: &[u8] = include_bytes!("pretrained.bin");
+            lstm.load_weights(WEIGHTS).expect("bundled pretrained.bin is corrupt");
         }
-        for row in lstm.w_gates.iter_mut() {
-            for v in row.iter_mut() { *v = rng(); }
-        }
-        for row in lstm.w_out.iter_mut() {
-            for v in row.iter_mut() { *v = rng(); }
+        #[cfg(not(feature = "pretrained"))]
+        {
+            let mut lcg: u64 = 0x_dead_beef_cafe_1234;
+            let mut rng = move || -> f32 {
+                lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let bits = ((lcg >> 33) as u32) as f32 / (u32::MAX as f32) - 0.5;
+                bits * 0.1
+            };
+            for row in lstm.embed.iter_mut() {
+                for v in row.iter_mut() { *v = rng(); }
+            }
+            for row in lstm.w_gates.iter_mut() {
+                for v in row.iter_mut() { *v = rng(); }
+            }
+            for row in lstm.w_out.iter_mut() {
+                for v in row.iter_mut() { *v = rng(); }
+            }
         }
         lstm
+    }
+
+    /// Load pretrained weights from a flat binary blob (f32 LE, Colab export format).
+    ///
+    /// Layout (matches `experiments/pretrain_colab.ipynb` export):
+    ///   embed    [256][64]  f32   →  65 536 bytes
+    ///   w_gates  [256][128] f32   → 131 072 bytes
+    ///   b_gates  [256]      f32   →   1 024 bytes
+    ///   w_out    [256][64]  f32   →  65 536 bytes
+    ///   b_out    [256]      f32   →   1 024 bytes
+    ///   total                     → 264 192 bytes
+    pub fn load_weights(&mut self, bytes: &[u8]) -> Result<(), &'static str> {
+        const EXPECTED: usize = (256*64 + 256*128 + 256 + 256*64 + 256) * 4;
+        if bytes.len() != EXPECTED {
+            return Err("pretrained weight file has wrong size");
+        }
+        let mut cursor = bytes;
+        let mut read_f32s = |dst: &mut [f32]| {
+            for v in dst.iter_mut() {
+                *v = f32::from_le_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
+                cursor = &cursor[4..];
+            }
+        };
+        for row in self.embed.iter_mut()    { read_f32s(row); }
+        for row in self.w_gates.iter_mut()  { read_f32s(row); }
+        read_f32s(&mut self.b_gates);
+        for row in self.w_out.iter_mut()    { read_f32s(row); }
+        read_f32s(&mut self.b_out);
+        Ok(())
     }
 
     /// Forward pass: given current byte, return P(next byte) [256 floats].
@@ -156,44 +194,61 @@ impl TinyLSTM {
     }
 
     /// Truncated BPTT-1 update given the actual byte that followed.
+    /// Only runs the full backward pass every 4th call (stride=4) for ~3× speedup.
     pub fn update(&mut self, actual: u8) {
+        use wide::f32x8;
         const MOMENTUM: f32 = 0.9;
+
+        // Stride-4: skip backward pass on 3 out of 4 bytes.
+        self.update_counter = self.update_counter.wrapping_add(1);
+        if self.update_counter & 3 != 0 {
+            self.lr = (self.lr * 0.9999).max(1e-6);
+            return;
+        }
 
         // --- Output layer gradient ---
         // grad_logits[i] = pred[i] - 1_{i == actual}
         let mut d_logits = self.last_logits;
         d_logits[actual as usize] -= 1.0;
 
-        // grad_h from output projection: d_h = W_out^T @ d_logits
+        // grad_h = W_out^T @ d_logits  (SIMD: 256 × 64)
         let mut d_h = [0f32; HIDDEN];
-        for (sym, row) in self.w_out.iter().enumerate() {
-            let dl = d_logits[sym];
-            for k in 0..HIDDEN {
-                d_h[k] += row[k] * dl;
+        for sym in 0..256usize {
+            let dl_v = f32x8::splat(d_logits[sym]);
+            for k in (0..HIDDEN).step_by(8) {
+                let w_v = f32x8::from(<[f32; 8]>::try_from(&self.w_out[sym][k..k + 8]).unwrap());
+                let d_v = f32x8::from(<[f32; 8]>::try_from(&d_h[k..k + 8]).unwrap());
+                d_h[k..k + 8].copy_from_slice(&(d_v + dl_v * w_v).to_array());
             }
         }
 
-        // Update W_out and b_out
-        for (sym, row) in self.w_out.iter_mut().enumerate() {
-            let dl = d_logits[sym];
-            for k in 0..HIDDEN {
-                let g = dl * self.h[k];
-                self.mom_out[sym][k] = MOMENTUM * self.mom_out[sym][k] + g;
-                row[k] -= self.lr * self.mom_out[sym][k];
+        // Update W_out and b_out  (SIMD: 256 × 64)
+        {
+            let lr_v  = f32x8::splat(self.lr);
+            let mom_v = f32x8::splat(MOMENTUM);
+            for sym in 0..256usize {
+                let dl_v = f32x8::splat(d_logits[sym]);
+                for k in (0..HIDDEN).step_by(8) {
+                    let h_v   = f32x8::from(<[f32; 8]>::try_from(&self.h[k..k + 8]).unwrap());
+                    let m     = f32x8::from(<[f32; 8]>::try_from(&self.mom_out[sym][k..k + 8]).unwrap());
+                    let m_new = mom_v * m + dl_v * h_v;
+                    let w_new = f32x8::from(<[f32; 8]>::try_from(&self.w_out[sym][k..k + 8]).unwrap())
+                        - lr_v * m_new;
+                    self.mom_out[sym][k..k + 8].copy_from_slice(&m_new.to_array());
+                    self.w_out[sym][k..k + 8].copy_from_slice(&w_new.to_array());
+                }
+                self.mom_b_out[sym] = MOMENTUM * self.mom_b_out[sym] + d_logits[sym];
+                self.b_out[sym] -= self.lr * self.mom_b_out[sym];
             }
-            self.mom_b_out[sym] = MOMENTUM * self.mom_b_out[sym] + d_logits[sym];
-            self.b_out[sym] -= self.lr * self.mom_b_out[sym];
         }
 
         // --- LSTM backward (1-step) ---
-        // d_h flows into o_gate and tanh(c)
-        let c = self.c; // current cell (post-update)
-        let mut d_c = [0f32; HIDDEN];
+        let c = self.c;
+        let mut d_c     = [0f32; HIDDEN];
         let mut d_gates = [0f32; GATES];
-
         for k in 0..HIDDEN {
             let tc = tanh_f(c[k]);
-            let d_o = d_h[k] * tc;
+            let d_o     = d_h[k] * tc;
             let d_tanh_c = d_h[k] * self.last_o[k];
             d_c[k] = d_tanh_c * (1.0 - tc * tc);
 
@@ -201,38 +256,59 @@ impl TinyLSTM {
             let d_f = d_c[k] * self.last_c_prev[k];
             let d_g = d_c[k] * self.last_i[k];
 
-            d_gates[k]              = d_i * self.last_i[k] * (1.0 - self.last_i[k]); // sigmoid'
+            d_gates[k]              = d_i * self.last_i[k] * (1.0 - self.last_i[k]);
             d_gates[HIDDEN + k]     = d_f * self.last_f[k] * (1.0 - self.last_f[k]);
-            d_gates[2 * HIDDEN + k] = d_g * (1.0 - self.last_g[k] * self.last_g[k]); // tanh'
+            d_gates[2 * HIDDEN + k] = d_g * (1.0 - self.last_g[k] * self.last_g[k]);
             d_gates[3 * HIDDEN + k] = d_o * self.last_o[k] * (1.0 - self.last_o[k]);
         }
 
-        // Update W_gates and b_gates
-        for (i, row) in self.w_gates.iter_mut().enumerate() {
-            let dg = d_gates[i];
-            for j in 0..XH {
-                let g = dg * self.last_xh[j];
-                self.mom_gates[i][j] = MOMENTUM * self.mom_gates[i][j] + g;
-                row[j] -= self.lr * self.mom_gates[i][j];
+        // Update W_gates and b_gates  (SIMD: 256 × 128)
+        {
+            let lr_v  = f32x8::splat(self.lr);
+            let mom_v = f32x8::splat(MOMENTUM);
+            for i in 0..GATES {
+                let dg_v = f32x8::splat(d_gates[i]);
+                for j in (0..XH).step_by(8) {
+                    let xh_v  = f32x8::from(<[f32; 8]>::try_from(&self.last_xh[j..j + 8]).unwrap());
+                    let m     = f32x8::from(<[f32; 8]>::try_from(&self.mom_gates[i][j..j + 8]).unwrap());
+                    let m_new = mom_v * m + dg_v * xh_v;
+                    let w_new = f32x8::from(<[f32; 8]>::try_from(&self.w_gates[i][j..j + 8]).unwrap())
+                        - lr_v * m_new;
+                    self.mom_gates[i][j..j + 8].copy_from_slice(&m_new.to_array());
+                    self.w_gates[i][j..j + 8].copy_from_slice(&w_new.to_array());
+                }
+                self.mom_b_gates[i] = MOMENTUM * self.mom_b_gates[i] + d_gates[i];
+                self.b_gates[i] -= self.lr * self.mom_b_gates[i];
             }
-            self.mom_b_gates[i] = MOMENTUM * self.mom_b_gates[i] + dg;
-            self.b_gates[i] -= self.lr * self.mom_b_gates[i];
         }
 
-        // Update embedding for the last input byte.
-        // d_x = W_gates[:, :EMBED]^T @ d_gates  (only EMBED columns needed)
-        let b = self.last_byte as usize;
-        let mut d_x = [0f32; EMBED];
-        for i in 0..GATES {
-            let dg = d_gates[i];
-            for j in 0..EMBED {
-                d_x[j] += self.w_gates[i][j] * dg;
+        // d_x = W_gates[:, :EMBED]^T @ d_gates + update embed  (SIMD)
+        {
+            let b = self.last_byte as usize;
+            let mut d_x = [0f32; EMBED];
+            for i in 0..GATES {
+                let dg_v = f32x8::splat(d_gates[i]);
+                for j in (0..EMBED).step_by(8) {
+                    let w_v = f32x8::from(<[f32; 8]>::try_from(&self.w_gates[i][j..j + 8]).unwrap());
+                    let d_v = f32x8::from(<[f32; 8]>::try_from(&d_x[j..j + 8]).unwrap());
+                    d_x[j..j + 8].copy_from_slice(&(d_v + dg_v * w_v).to_array());
+                }
+            }
+            let lr_v  = f32x8::splat(self.lr);
+            let mom_v = f32x8::splat(MOMENTUM);
+            for k in (0..EMBED).step_by(8) {
+                let dx_v  = f32x8::from(<[f32; 8]>::try_from(&d_x[k..k + 8]).unwrap());
+                let m     = f32x8::from(<[f32; 8]>::try_from(&self.mom_embed[b][k..k + 8]).unwrap());
+                let m_new = mom_v * m + dx_v;
+                let e_new = f32x8::from(<[f32; 8]>::try_from(&self.embed[b][k..k + 8]).unwrap())
+                    - lr_v * m_new;
+                self.mom_embed[b][k..k + 8].copy_from_slice(&m_new.to_array());
+                self.embed[b][k..k + 8].copy_from_slice(&e_new.to_array());
             }
         }
-        for k in 0..EMBED {
-            self.mom_embed[b][k] = MOMENTUM * self.mom_embed[b][k] + d_x[k];
-            self.embed[b][k] -= self.lr * self.mom_embed[b][k];
-        }
+
+        // LR decay: 0.9999 per byte, floor at 1e-6
+        self.lr = (self.lr * 0.9999).max(1e-6);
     }
 
     /// Reset hidden/cell state (e.g. between files in an archive).

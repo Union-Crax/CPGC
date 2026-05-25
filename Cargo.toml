@@ -2,6 +2,13 @@
 name = "cpgc"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
+
+[features]
+# Bundle pre-trained weights into the binary.
+# Place weights at src/predictor/pretrained.bin then:
+#   cargo build --release --features pretrained
+pretrained = []
 
 [dependencies]
 rayon = "1.8"

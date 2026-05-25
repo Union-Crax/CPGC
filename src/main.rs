@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -55,6 +56,7 @@ fn cmd_compress(input: &PathBuf, output: &PathBuf, level: u8) -> Result<()> {
         use cpgc::archive::solid::SolidArchive;
         use walkdir::WalkDir;
         let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+        eprintln!("scanning {:?}...", input);
         for entry in WalkDir::new(input).sort_by_file_name() {
             let entry = entry.with_context(|| format!("walking {:?}", input))?;
             if !entry.file_type().is_file() { continue; }
@@ -64,15 +66,23 @@ fn cmd_compress(input: &PathBuf, output: &PathBuf, level: u8) -> Result<()> {
                 .replace('\\', "/");
             let data = std::fs::read(entry.path())
                 .with_context(|| format!("reading {:?}", entry.path()))?;
+            eprintln!("  + {}  ({} B)", rel, data.len());
             files.push((rel, data));
         }
+        let total_raw: usize = files.iter().map(|(_, d)| d.len()).sum();
+        eprintln!("compressing {} files ({:.1} MB total)...", files.len(), total_raw as f64 / 1e6);
         let pairs: Vec<(&str, &[u8])> = files.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
         let t0 = Instant::now();
-        let packed = SolidArchive::pack(&pairs, level)?;
+        let packed = SolidArchive::pack_with_progress(&pairs, level, |done, total| {
+            let pct = done as f64 / total.max(1) as f64 * 100.0;
+            eprint!("\r  {:5.1}%  ({:.1} MB / {:.1} MB)    ",
+                pct, done as f64 / 1e6, total as f64 / 1e6);
+            let _ = std::io::stderr().flush();
+        })?;
+        eprintln!();
         let elapsed = t0.elapsed().as_secs_f64();
         std::fs::write(output, &packed)
             .with_context(|| format!("writing {:?}", output))?;
-        let total_raw: usize = files.iter().map(|(_, d)| d.len()).sum();
         println!(
             "{:?} ({} files) → {:?}\n  {:>10} bytes → {:>10} bytes  ({:.3} ratio)\n  {:.3} MB/s  ({:.2}s)",
             input, files.len(), output,
@@ -86,8 +96,15 @@ fn cmd_compress(input: &PathBuf, output: &PathBuf, level: u8) -> Result<()> {
     let data = std::fs::read(input)
         .with_context(|| format!("reading {:?}", input))?;
 
+    eprintln!("compressing {:?} ({:.1} MB)...", input, data.len() as f64 / 1e6);
     let t0 = Instant::now();
-    let compressed = cpgc::codec::compress(&data, level)?;
+    let compressed = cpgc::codec::compress_with_progress(&data, level, |done, total| {
+        let pct = done as f64 / total.max(1) as f64 * 100.0;
+        eprint!("\r  {:5.1}%  ({:.1} MB / {:.1} MB)    ",
+            pct, done as f64 / 1e6, total as f64 / 1e6);
+        let _ = std::io::stderr().flush();
+    })?;
+    eprintln!();
     let elapsed = t0.elapsed().as_secs_f64();
 
     std::fs::write(output, &compressed)
@@ -106,6 +123,7 @@ fn cmd_decompress(input: &PathBuf, output: &PathBuf) -> Result<()> {
     let data = std::fs::read(input)
         .with_context(|| format!("reading {:?}", input))?;
 
+    eprintln!("decompressing {:?} ({} bytes)...", input, data.len());
     let t0 = Instant::now();
     let recovered = cpgc::codec::decompress(&data)?;
     let elapsed = t0.elapsed().as_secs_f64();
@@ -222,18 +240,26 @@ fn cmd_bench(corpus_dir: &PathBuf) -> Result<()> {
     let mut total_comp = 0usize;
 
     for path in &files {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
         let data = match fs::read(path) {
             Ok(d) => d,
             Err(e) => { eprintln!("skip {:?}: {}", path, e); continue; }
         };
+        let short_name = name[..name.len().min(40)].to_string();
+        eprint!("  {:<40}  ", &short_name);
+        let _ = std::io::stderr().flush();
         let t0 = Instant::now();
-        let comp = match cpgc::codec::compress(&data, 5) {
+        let comp = match cpgc::codec::compress_with_progress(&data, 5, |done, total| {
+            let pct = done as f64 / total.max(1) as f64 * 100.0;
+            eprint!("\r  {:<40}  {:5.1}%", &short_name, pct);
+            let _ = std::io::stderr().flush();
+        }) {
             Ok(c) => c,
-            Err(e) => { eprintln!("error {:?}: {}", path, e); continue; }
+            Err(e) => { eprintln!("\nerror {:?}: {}", path, e); continue; }
         };
+        eprint!("\r  {:<40}  done \n", &short_name);
         let elapsed = t0.elapsed().as_secs_f64();
 
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
         let ratio = comp.len() as f64 / data.len().max(1) as f64;
         let bpb   = comp.len() as f64 * 8.0 / data.len().max(1) as f64;
         let mb_s  = data.len() as f64 / elapsed / 1_000_000.0;

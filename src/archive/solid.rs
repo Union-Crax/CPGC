@@ -33,6 +33,15 @@ impl SolidArchive {
 
     /// Compress `files` (slice of (name, data) pairs) into a solid archive.
     pub fn pack(files: &[(&str, &[u8])], level: u8) -> Result<Vec<u8>> {
+        Self::pack_with_progress(files, level, |_, _| {})
+    }
+
+    /// Same as `pack` but forwards a progress callback to the codec.
+    pub fn pack_with_progress(
+        files: &[(&str, &[u8])],
+        level: u8,
+        on_progress: impl Fn(usize, usize),
+    ) -> Result<Vec<u8>> {
         // Build file table
         let n = files.len() as u32;
         let mut table: Vec<u8> = Vec::new();
@@ -51,7 +60,7 @@ impl SolidArchive {
         for &(_, data) in files {
             combined.extend_from_slice(data);
         }
-        let payload = crate::codec::compress(&combined, level)?;
+        let payload = crate::codec::compress_with_progress(&combined, level, on_progress)?;
 
         let mut out = Vec::with_capacity(table.len() + payload.len());
         out.extend_from_slice(&table);

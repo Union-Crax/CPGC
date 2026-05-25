@@ -38,6 +38,15 @@ const TAG_PASSTHROUGH: u8 = 0xFF;
 
 /// Compress `input` using the ContextMixer + rANS codec.
 pub fn compress(input: &[u8], level: u8) -> Result<Vec<u8>> {
+    compress_with_progress(input, level, |_, _| {})
+}
+
+/// Same as `compress` but calls `on_progress(bytes_encoded, total_bytes)` every 64 KB.
+pub fn compress_with_progress(
+    input: &[u8],
+    level: u8,
+    on_progress: impl Fn(usize, usize),
+) -> Result<Vec<u8>> {
     let n = input.len();
     let n_blocks = if n == 0 { 0usize } else { (n + WINDOW_SIZE - 1) / WINDOW_SIZE };
 
@@ -93,15 +102,28 @@ pub fn compress(input: &[u8], level: u8) -> Result<Vec<u8>> {
     // ------------------------------------------------------------------
     // Step 3: LSTM + ANS encode the non-passthrough stream
     // ------------------------------------------------------------------
+    let pretrained = std::env::var_os("CPGC_WEIGHTS")
+        .and_then(|p| std::fs::read(p).ok());
     let uniform = [1.0f32 / 256.0; 256];
-    let mut mixer = ContextMixer::new(0.005);
+    let mut mixer = ContextMixer::new_with_pretrained(0.005, pretrained.as_deref());
     let mut enc = AnsEncoder::new(&uniform);
-    for &byte in &to_encode {
+    // Progress is reported against the *full* input size so passthrough-heavy
+    // files (e.g. already-compressed executables) show real MB/total MB.
+    let grand_total = n.max(1);
+    let pt_done = passthrough_data.len(); // passthrough bytes are instantly "done"
+    if pt_done > 0 {
+        on_progress(pt_done.min(grand_total), grand_total);
+    }
+    for (i, &byte) in to_encode.iter().enumerate() {
         let dist = mixer.predict();
         enc.update_table(&dist);
         enc.encode(byte);
         mixer.update(byte);
+        if i & 0xFFFF == 0xFFFF {
+            on_progress((pt_done + i + 1).min(grand_total), grand_total);
+        }
     }
+    on_progress(grand_total, grand_total);
     let ans_payload = enc.finish();
 
     // ------------------------------------------------------------------
@@ -176,8 +198,10 @@ pub fn decompress(input: &[u8]) -> Result<Vec<u8>> {
     }).sum();
 
     let ans_decoded: Vec<u8> = if ans_byte_count > 0 {
+        let pretrained = std::env::var_os("CPGC_WEIGHTS")
+            .and_then(|p| std::fs::read(p).ok());
         let uniform = [1.0f32 / 256.0; 256];
-        let mut mixer = ContextMixer::new(0.005);
+        let mut mixer = ContextMixer::new_with_pretrained(0.005, pretrained.as_deref());
         let mut dec = AnsDecoder::new(ans_payload, &uniform)
             .ok_or_else(|| anyhow!("ANS decoder: payload too short"))?;
         let mut buf = Vec::with_capacity(ans_byte_count);

@@ -4,17 +4,18 @@
 use crate::predictor::{
     lstm::TinyLSTM,
     match_model::MatchModel,
-    order_n::{Order1Model, Order2Model, Order4Model},
+    order_n::{Order1Model, Order2Model, Order4Model, Order5Model},
     run_model::RunModel,
 };
 
-const NUM_MODELS: usize = 6;
+const NUM_MODELS: usize = 7;
 
 pub struct ContextMixer {
     pub lstm:        Box<TinyLSTM>,
     pub order1:      Box<Order1Model>,
     pub order2:      Order2Model,
     pub order4:      Order4Model,
+    pub order5:      Order5Model,
     pub run_model:   RunModel,
     pub match_model: MatchModel,
 
@@ -25,15 +26,27 @@ pub struct ContextMixer {
     prev1: u8,
     prev2: u8,
     ctx4:  u32,
+    ctx5:  u64,   // lower 5 bytes used as order-5 key
 }
 
 impl ContextMixer {
     pub fn new(lr: f32) -> Self {
+        Self::new_with_pretrained(lr, None)
+    }
+
+    pub fn new_with_pretrained(lr: f32, pretrained: Option<&[u8]>) -> Self {
+        let mut lstm = TinyLSTM::new(lr);
+        if let Some(bytes) = pretrained {
+            if let Err(e) = lstm.load_weights(bytes) {
+                eprintln!("warning: could not load pretrained weights: {e}");
+            }
+        }
         Self {
-            lstm:        TinyLSTM::new(lr),
+            lstm,
             order1:      Order1Model::new(),
             order2:      Order2Model::new(),
             order4:      Order4Model::new(),
+            order5:      Order5Model::new(),
             run_model:   RunModel::new(),
             match_model: MatchModel::new(),
             mix_weights: [1.0 / NUM_MODELS as f32; NUM_MODELS],
@@ -41,6 +54,7 @@ impl ContextMixer {
             prev1:       0,
             prev2:       0,
             ctx4:        0,
+            ctx5:        0,
         }
     }
 
@@ -51,6 +65,7 @@ impl ContextMixer {
             self.order1.predict(self.prev1),
             self.order2.predict(self.prev2, self.prev1),
             self.order4.predict(self.ctx4),
+            self.order5.predict(self.ctx5),
             self.run_model.predict(),
             self.match_model.predict(),
         ];
@@ -73,6 +88,7 @@ impl ContextMixer {
             self.order1.predict(self.prev1),
             self.order2.predict(self.prev2, self.prev1),
             self.order4.predict(self.ctx4),
+            self.order5.predict(self.ctx5),
             self.run_model.predict(),
             self.match_model.predict(),
         ];
@@ -83,12 +99,13 @@ impl ContextMixer {
             self.mix_weights[i] += self.mix_lr * log_p;
         }
         // Normalize via softmax
-        self.mix_weights = softmax6(self.mix_weights);
+        self.mix_weights = softmax_mix(self.mix_weights);
 
         // Update statistical models
         self.order1.update(self.prev1, actual);
         self.order2.update(self.prev2, self.prev1, actual);
         self.order4.update(self.ctx4, actual);
+        self.order5.update(self.ctx5, actual);
         self.run_model.update(actual);
         self.match_model.update(actual);
 
@@ -96,6 +113,7 @@ impl ContextMixer {
         self.prev2 = self.prev1;
         self.prev1 = actual;
         self.ctx4 = (self.ctx4 << 8) | (actual as u32);
+        self.ctx5 = (self.ctx5 << 8) | (actual as u64);
     }
 }
 
@@ -119,7 +137,7 @@ fn blend_predictions(preds: &[[f32; 256]; NUM_MODELS], weights: &[f32; NUM_MODEL
     log_blend
 }
 
-fn softmax6(mut w: [f32; NUM_MODELS]) -> [f32; NUM_MODELS] {
+fn softmax_mix(mut w: [f32; NUM_MODELS]) -> [f32; NUM_MODELS] {
     let max = w.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0f32;
     for v in w.iter_mut() {
