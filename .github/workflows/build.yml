@@ -1,0 +1,107 @@
+name: build
+
+# Builds the CLI (cpgc) and the GUI (cpgc-gui) for Linux, macOS and Windows so
+# users never have to compile anything. Pushing a tag like `v0.1.0` also
+# publishes a GitHub Release with:
+#   - cpgc-cli-<os>      — the command-line tool on its own
+#   - cpgc-gui-<os>      — the desktop app
+#   - CPGC-Setup.exe     — a real Windows installer (Start-Menu/desktop icons)
+#
+# Run it manually (Actions ▸ build ▸ Run workflow) to get the binaries as
+# downloadable artifacts without tagging a release.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,  name: linux }
+          - { os: macos-latest,   name: macos }
+          - { os: windows-latest, name: windows }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux GUI dependencies
+        if: matrix.name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+
+      - name: Build CLI (lean, no GUI deps)
+        run: cargo build --release --bin cpgc
+
+      - name: Build GUI
+        run: cargo build --release --features gui --bin cpgc-gui
+
+      - name: Run tests
+        run: cargo test --release --features gui
+
+      # ---- packaging -------------------------------------------------------
+      - name: Package (Unix)
+        if: matrix.name != 'windows'
+        run: |
+          mkdir -p dist
+          tar -czf "dist/cpgc-cli-${{ matrix.name }}.tar.gz" -C target/release cpgc
+          tar -czf "dist/cpgc-gui-${{ matrix.name }}.tar.gz" -C target/release cpgc-gui
+
+      - name: Determine version
+        if: matrix.name == 'windows'
+        shell: pwsh
+        run: |
+          $v = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF_NAME.TrimStart('v') } else { '0.0.0' }
+          "CPGC_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build Windows installer (Inno Setup)
+        if: matrix.name == 'windows'
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            "/DMyAppVersion=$env:CPGC_VERSION" installer\cpgc.iss
+          Compress-Archive -Path target\release\cpgc.exe     -DestinationPath dist\cpgc-cli-windows.zip -Force
+          Compress-Archive -Path target\release\cpgc-gui.exe -DestinationPath dist\cpgc-gui-windows.zip -Force
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpgc-${{ matrix.name }}
+          path: dist/*
+
+  release:
+    name: publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true

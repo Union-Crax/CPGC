@@ -129,40 +129,52 @@ Input → Content Analyzer → Transform Preprocessor → CPGC-NX context mixer 
 
 ---
 
-## Build
+## Download / install (no compiling)
+
+Prebuilt binaries and a Windows installer are produced by GitHub Actions for
+every tagged release (and as downloadable artifacts on every run). There are
+**two separate downloads** — grab whichever you need:
+
+- **`CPGC-Setup.exe`** (Windows) — a real installer for the desktop app
+  (`cpgc-gui`): Start-Menu + desktop shortcuts, optional "add CLI to PATH".
+- **`cpgc-cli-<os>`** — just the `cpgc` command-line tool.
+- **`cpgc-gui-<os>`** — the desktop app on its own (macOS/Linux).
+
+See the project's **Releases** page, or **Actions ▸ build** for per-commit
+artifacts.
+
+## Build from source
+
+The CLI and GUI are **separate binaries**, so the CLI builds without any GUI
+dependencies:
 
 ```sh
-cargo build --release          # includes the native GUI (default)
-cargo build --release --no-default-features   # lean CLI-only binary
+cargo build --release --bin cpgc                  # CLI only (lean)
+cargo build --release --features gui --bin cpgc-gui   # desktop app
 ```
-
-Binary: `target/release/cpgc`
 
 ---
 
 ## GUI (native 7-Zip-style app)
 
-```sh
-cpgc gui                       # opens a desktop window
-cpgc gui --dir /data           # start in a specific folder
-```
+`cpgc-gui` (run the binary, or `cpgc-gui /some/folder` to start there) opens a
+real native window — not a browser:
 
-`cpgc gui` opens a real native window (egui/eframe — no browser):
+- A **menu bar**, a **toolbar** (Up / Add / Info / Extract / Test), a file list
+  with **Name / Size / Modified** columns, and a **status bar** showing the
+  selection count, like a familiar archive manager.
+- **Add** opens an "Add to Archive" dialog (name + level) and compresses the
+  ticked files/folders into a `.cpgc` single-file or `.cpas` solid archive.
+- **Open** an archive to browse its members, tick individual ones, and
+  **Extract** them (or **Extract all**). **Test** verifies an archive.
+- Every long operation runs on a background thread and can be **paused,
+  resumed, or cancelled**, with a live progress bar and **throughput (MB/s)**.
 
-- **Browse** folders, tick files or directories, choose a compression level,
-  and click **Compress** to make a `.cpgc` single-file or `.cpas` solid archive.
-- **Open an archive** (like opening a folder) to browse its contents, then tick
-  individual members and **Extract selected**, or **Extract all**. **Verify**
-  checks an archive decodes correctly.
-- Long operations run on a background thread with a live progress bar.
-
-It is cross-platform (Windows/macOS/Linux) and needs a graphical desktop to
-run; on a headless machine it exits with a clear "no display" message — use the
-CLI there.
+Cross-platform (Windows/macOS/Linux); it needs a graphical desktop to run.
 
 ---
 
-## Compression levels
+## Compression levels (CLI `-l`, or the GUI level selector)
 
 `-l`/`--level` (1–9, default 5) trades speed for ratio by setting the parallel
 **segment size**: lower levels use smaller segments (more cores, faster, a

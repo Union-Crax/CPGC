@@ -35,17 +35,38 @@ const TAG_PASSTHROUGH: u8 = 0xFF;
 // Compress
 // ---------------------------------------------------------------------------
 
-/// Compress `input` using the ContextMixer + rANS codec.
+/// Compress `input` using the CPGC-NX context-mixing codec.
 pub fn compress(input: &[u8], level: u8) -> Result<Vec<u8>> {
-    compress_with_progress(input, level, |_, _| {})
+    compress_with_control(input, level, &cm::Control::new())
 }
 
-/// Same as `compress` but calls `on_progress(bytes_encoded, total_bytes)` every 64 KB.
+/// Compress, polling progress on the calling thread.
+///
+/// `on_progress(bytes_done, total_bytes)` is called a few times a second while
+/// a worker thread does the actual compression.
 pub fn compress_with_progress(
     input: &[u8],
     level: u8,
     on_progress: impl Fn(usize, usize),
 ) -> Result<Vec<u8>> {
+    let total = input.len().max(1);
+    let ctrl = cm::Control::new();
+    let mut result: Option<Result<Vec<u8>>> = None;
+    std::thread::scope(|s| {
+        let handle = s.spawn(|| compress_with_control(input, level, &ctrl));
+        while !handle.is_finished() {
+            on_progress((ctrl.bytes_done() as usize).min(total), total);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        result = Some(handle.join().unwrap_or_else(|_| Err(anyhow!("worker panicked"))));
+    });
+    on_progress(total, total);
+    result.unwrap()
+}
+
+/// Compress with a shared [`cm::Control`] for pause/resume/cancel and a live
+/// byte counter (used by the GUI). Returns an error if the job is cancelled.
+pub fn compress_with_control(input: &[u8], level: u8, ctrl: &cm::Control) -> Result<Vec<u8>> {
     let n = input.len();
     let n_blocks = if n == 0 { 0usize } else { (n + WINDOW_SIZE - 1) / WINDOW_SIZE };
 
@@ -104,15 +125,8 @@ pub fn compress_with_progress(
     // ------------------------------------------------------------------
     // Step 3: CPGC-NX context-mixing encode of the non-passthrough stream
     // ------------------------------------------------------------------
-    // Progress is reported against the *full* input size so passthrough-heavy
-    // files (e.g. already-compressed executables) show real MB/total MB.
-    let grand_total = n.max(1);
-    let pt_done = passthrough_data.len(); // passthrough bytes are instantly "done"
-    if pt_done > 0 {
-        on_progress(pt_done.min(grand_total), grand_total);
-    }
-    let ans_payload = cm::encode(&to_encode, level);
-    on_progress(grand_total, grand_total);
+    let ans_payload = cm::encode_with_control(&to_encode, level, ctrl)
+        .ok_or_else(|| anyhow!("compression cancelled"))?;
 
     // ------------------------------------------------------------------
     // Step 4: Assemble output
@@ -141,6 +155,12 @@ pub fn compress_with_progress(
 
 /// Decompress bytes produced by `compress()`.
 pub fn decompress(input: &[u8]) -> Result<Vec<u8>> {
+    decompress_with_control(input, &cm::Control::new())
+}
+
+/// Decompress with a shared [`cm::Control`] for pause/resume/cancel and a live
+/// byte counter (used by the GUI). Returns an error if cancelled.
+pub fn decompress_with_control(input: &[u8], ctrl: &cm::Control) -> Result<Vec<u8>> {
     // Minimum header: magic(4) + version(1) + flags(1) + orig_len(8) + n_blocks(4) + passthrough_len(4) = 22
     if input.len() < 22 {
         return Err(anyhow!("input too short for CPGC header"));
@@ -186,7 +206,8 @@ pub fn decompress(input: &[u8]) -> Result<Vec<u8>> {
     }).sum();
 
     let ans_decoded: Vec<u8> = if ans_byte_count > 0 {
-        cm::decode(ans_payload, ans_byte_count)
+        cm::decode_with_control(ans_payload, ans_byte_count, ctrl)
+            .ok_or_else(|| anyhow!("decompression cancelled"))?
     } else {
         Vec::new()
     };
