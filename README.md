@@ -91,6 +91,28 @@ The previous online-LSTM engine (which topped out around 2.95 bpb at ~0.4 MB/s)
 still lives in `src/predictor/` and `src/ans/` for reference, but is no longer
 on the compression path.
 
+### Binary media & game files
+
+Text is the easy case; structured binary is where naive byte models fall over.
+Uncompressed media looks random at the byte level (16-bit audio, RGB pixels)
+even though it is highly compressible by *stride*. CPGC-NX adds **sparse stride
+models** (strides 2, 3, 4, 8) that predict each byte from the same lane of the
+previous sample(s), and a **stride-aware incompressibility test** so structured
+media reaches the compressor instead of being passed through.
+
+| file | type | orig | **CPGC-NX** | gzip -9 | bzip2 -9 | xz -9 |
+|---|---|--:|--:|--:|--:|--:|
+| image.rgb | 24-bit image | 2,430,000 | **54,609** | 424,672 | 409,657 | 115,296 |
+| exe.bin | executable | 1,124,888 | **372,582** | 492,925 | 463,361 | 398,536 |
+| game.dat | record data | 1,920,000 | 644,815 | 1,070,121 | 793,477 | **640,812** |
+| audio.pcm | 16-bit PCM | 2,400,000 | 965,128 | 2,311,622 | 2,079,406 | **596,752** |
+
+CPGC-NX wins clearly on images and executables and ties on record data.
+Already-compressed media (MP3, JPEG, H.264, PNG, ZIP'd game assets) is
+high-entropy and is **passed through unchanged** — no wasted time, no
+expansion. Raw PCM audio still trails xz (linear-predictive residuals are
+LZMA's strong suit) but is no longer mishandled.
+
 ---
 
 ## Architecture
@@ -110,38 +132,69 @@ Input → Content Analyzer → Transform Preprocessor → CPGC-NX context mixer 
 ## Build
 
 ```sh
-cargo build --release
+cargo build --release          # includes the web GUI (default)
+cargo build --release --no-default-features   # lean CLI-only binary
 ```
 
-Binary: `target/release/cpgc.exe`
+Binary: `target/release/cpgc`
+
+---
+
+## GUI (7-Zip-style, in your browser)
+
+```sh
+cpgc gui                       # then open http://127.0.0.1:8087
+cpgc gui --port 9000 --root /data
+```
+
+`cpgc gui` starts a small local web server and serves a file-manager UI: browse
+folders, tick files/folders to compress into a `.cpgc`/`.cpas` archive, inspect
+archives, and extract them — all with a couple of clicks. Because it is plain
+HTTP + HTML it works identically on a headless server (browse to it from
+another machine over an SSH tunnel) and on a desktop, with no GL/X11/display
+dependencies. All file access is sandboxed under `--root` (default: the current
+directory).
 
 ---
 
 ## CLI Usage
 
-### Compress a file
+Subcommands have short aliases: `c` (compress), `x` (decompress), `t` (verify).
+
+### Compress a file or directory
 
 ```sh
-cpgc compress <input> <output.cpgc> [-l <level>]
+cpgc compress <input> [output.cpgc] [-l <level>]
 ```
 
-`-l` / `--level`: 1–9, default 5 (reserved for future tuning — currently no-op).
+The output path is optional — it defaults to `<input>.cpgc`. Pass a directory
+to build a solid multi-file archive. `-l`/`--level` is 1–9 (default 5); levels
+≥ 5 enable the content analyzer and transform pass.
 
 ```
-path/to/file.txt → file.cpgc
+"file.txt" → "file.txt.cpgc"
         12345 bytes →       9876 bytes  (0.800 ratio)
   0.423 MB/s  (0.03s)
 ```
 
-### Decompress
+### Decompress / extract
 
 ```sh
-cpgc decompress <input.cpgc> <output>
+cpgc decompress <input.cpgc> [output]
 ```
 
+The output is optional — it defaults to the original name (`.cpgc` stripped).
+Solid (`.cpas`) archives are unpacked into the output directory automatically.
+
 ```
-file.cpgc → recovered.txt
+"file.txt.cpgc" → "file.txt"
         12345 bytes recovered  (0.401 MB/s, 0.03s)
+```
+
+### Verify an archive
+
+```sh
+cpgc verify <archive>          # decodes in memory, writes nothing
 ```
 
 ### Show archive info

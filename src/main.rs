@@ -13,19 +13,28 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Compress a file
+    /// Compress a file or directory. Output defaults to <input>.cpgc
+    #[command(visible_alias = "c")]
     Compress {
         input: PathBuf,
-        output: PathBuf,
+        /// Output path (default: <input>.cpgc)
+        output: Option<PathBuf>,
         #[arg(short, long, default_value_t = 5)]
         level: u8,
     },
-    /// Decompress a file
+    /// Decompress an archive. Output defaults to the original name
+    #[command(visible_alias = "x")]
     Decompress {
         input: PathBuf,
-        output: PathBuf,
+        /// Output path (default: input with .cpgc stripped, else <input>.out)
+        output: Option<PathBuf>,
     },
-    /// List archive contents (placeholder — solid archive not yet implemented)
+    /// Verify an archive decodes correctly without writing output
+    #[command(visible_alias = "t")]
+    Verify {
+        archive: PathBuf,
+    },
+    /// List archive contents
     List {
         archive: PathBuf,
     },
@@ -37,20 +46,51 @@ enum Commands {
     Info {
         archive: PathBuf,
     },
+    /// Launch the local web GUI (7-Zip-style file manager in your browser)
+    Gui {
+        /// Port to listen on
+        #[arg(short, long, default_value_t = 8087)]
+        port: u16,
+        /// Directory the GUI is allowed to browse (default: current directory)
+        #[arg(short, long)]
+        root: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Compress { input, output, level } => cmd_compress(&input, &output, level),
-        Commands::Decompress { input, output }       => cmd_decompress(&input, &output),
+        Commands::Compress { input, output, level } => cmd_compress(&input, output.as_ref(), level),
+        Commands::Decompress { input, output }       => cmd_decompress(&input, output.as_ref()),
+        Commands::Verify { archive }                 => cmd_verify(&archive),
         Commands::List { archive }                   => cmd_list(&archive),
         Commands::Bench { corpus_dir }               => cmd_bench(&corpus_dir),
         Commands::Info { archive }                   => cmd_info(&archive),
+        Commands::Gui { port, root }                 => cmd_gui(port, root),
     }
 }
 
-fn cmd_compress(input: &PathBuf, output: &PathBuf, level: u8) -> Result<()> {
+/// Derive a default output path for compression: append `.cpgc`.
+fn default_compress_output(input: &PathBuf) -> PathBuf {
+    let mut s = input.as_os_str().to_os_string();
+    s.push(".cpgc");
+    PathBuf::from(s)
+}
+
+/// Derive a default output path for decompression: strip `.cpgc`, else `.out`.
+fn default_decompress_output(input: &PathBuf) -> PathBuf {
+    if input.extension().map(|e| e == "cpgc" || e == "cpas").unwrap_or(false) {
+        input.with_extension("")
+    } else {
+        let mut s = input.as_os_str().to_os_string();
+        s.push(".out");
+        PathBuf::from(s)
+    }
+}
+
+fn cmd_compress(input: &PathBuf, output: Option<&PathBuf>, level: u8) -> Result<()> {
+    let output = output.cloned().unwrap_or_else(|| default_compress_output(input));
+    let output = &output;
     // If input is a directory, create a solid multi-file archive.
     if input.is_dir() {
         use cpgc::archive::solid::SolidArchive;
@@ -119,9 +159,35 @@ fn cmd_compress(input: &PathBuf, output: &PathBuf, level: u8) -> Result<()> {
     Ok(())
 }
 
-fn cmd_decompress(input: &PathBuf, output: &PathBuf) -> Result<()> {
+fn cmd_decompress(input: &PathBuf, output: Option<&PathBuf>) -> Result<()> {
+    let output = output.cloned().unwrap_or_else(|| default_decompress_output(input));
+    let output = &output;
     let data = std::fs::read(input)
         .with_context(|| format!("reading {:?}", input))?;
+
+    // A solid (multi-file) archive must be unpacked, not byte-decompressed.
+    if data.starts_with(b"CPAS") {
+        use cpgc::archive::solid::SolidArchive;
+        let files = SolidArchive::unpack(&data)?;
+        std::fs::create_dir_all(output)
+            .with_context(|| format!("creating output dir {:?}", output))?;
+        for (name, bytes) in &files {
+            let safe: PathBuf = std::path::Path::new(name)
+                .components()
+                .filter_map(|c| match c {
+                    std::path::Component::Normal(p) => Some(p),
+                    _ => None,
+                })
+                .collect();
+            let dest = output.join(&safe);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&dest, bytes)?;
+        }
+        println!("{:?} → {:?}  ({} files extracted)", input, output, files.len());
+        return Ok(());
+    }
 
     eprintln!("decompressing {:?} ({} bytes)...", input, data.len());
     let t0 = Instant::now();
@@ -137,6 +203,39 @@ fn cmd_decompress(input: &PathBuf, output: &PathBuf) -> Result<()> {
         input, output, recovered.len(), mb_s, elapsed
     );
     Ok(())
+}
+
+fn cmd_verify(archive: &PathBuf) -> Result<()> {
+    let data = std::fs::read(archive)
+        .with_context(|| format!("reading {:?}", archive))?;
+    let t0 = Instant::now();
+    if data.starts_with(b"CPAS") {
+        use cpgc::archive::solid::SolidArchive;
+        let files = SolidArchive::unpack(&data)?;
+        let total: usize = files.iter().map(|(_, d)| d.len()).sum();
+        println!(
+            "OK — solid archive verified: {} file(s), {} bytes recovered ({:.2}s)",
+            files.len(), total, t0.elapsed().as_secs_f64()
+        );
+    } else {
+        let recovered = cpgc::codec::decompress(&data)?;
+        println!(
+            "OK — archive verified: {} bytes recovered ({:.2}s)",
+            recovered.len(), t0.elapsed().as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "gui")]
+fn cmd_gui(port: u16, root: Option<PathBuf>) -> Result<()> {
+    let root = root.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    cpgc::gui::run(port, root)
+}
+
+#[cfg(not(feature = "gui"))]
+fn cmd_gui(_port: u16, _root: Option<PathBuf>) -> Result<()> {
+    bail!("this binary was built without the `gui` feature; rebuild with `cargo build --features gui`")
 }
 
 fn cmd_info(archive: &PathBuf) -> Result<()> {
