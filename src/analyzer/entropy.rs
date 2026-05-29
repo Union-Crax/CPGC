@@ -20,6 +20,32 @@ pub fn is_high_entropy(data: &[u8]) -> bool {
     entropy_bits(data) > 7.5
 }
 
+/// Returns true only if data is *genuinely* incompressible.
+///
+/// Order-0 byte entropy alone is a poor test: structured binary media such as
+/// 16-bit PCM audio or RGB images looks near-random at the byte level yet is
+/// highly compressible once you account for its stride. This probes the entropy
+/// of several stride deltas; if any of them is markedly lower than the raw
+/// entropy, the data has exploitable structure and must NOT be passed through.
+pub fn is_truly_incompressible(data: &[u8]) -> bool {
+    if entropy_bits(data) <= 7.5 {
+        return false;
+    }
+    // Probe stride deltas (stride 1 = adjacent bytes, 2/3/4 = common sample
+    // widths for audio/RGB/RGBA). A clear entropy drop means structure.
+    for stride in [1usize, 2, 3, 4] {
+        if data.len() > stride {
+            let d: Vec<u8> = (stride..data.len())
+                .map(|i| data[i].wrapping_sub(data[i - stride]))
+                .collect();
+            if entropy_bits(&d) < 7.0 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

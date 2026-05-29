@@ -42,17 +42,35 @@ fn table_bits(n: usize) -> u32 {
     target.clamp(HBITS_MIN, HBITS_MAX)
 }
 
-// Counter adaptation rates (fast / slow).
+// Counter adaptation rates (fast / slow). Stride models use a middle rate.
 const RATE_FAST: i32 = 3;
 const RATE_SLOW: i32 = 6;
+const RATE_STRIDE: i32 = 4;
+
+/// Adapt a single 16-bit `P(bit==1)` counter toward the observed bit.
+#[inline]
+fn counter_update(slot: &mut u16, bit: i32) {
+    let p = *slot as i32;
+    *slot = (p + (((bit << 16) - p) >> RATE_STRIDE)) as u16;
+}
+
+// Sparse "stride" models capture fixed-period structure in binary media:
+// 16-bit / stereo audio (stride 2, 4), RGB / RGBA images (stride 3, 4), and
+// many fixed-record game formats. Each predicts the current byte from the
+// same lane of previous samples. The mixer learns to trust them on media and
+// ignore them on text, so they are safe to always include.
+const STRIDES: [usize; 4] = [2, 3, 4, 8];
+const NSTRIDE: usize = STRIDES.len();
 
 // Mixer inputs:
-//   7 counter models * 2 rates  = 14
+//   7 counter models * 2 rates           = 14
+// + NSTRIDE single-rate stride models
 // + 1 match model
 // + 1 bias
 const NCTX: usize = 7;
-const NIN: usize = NCTX * 2 + 2;
-const MATCH_IN: usize = NCTX * 2; // index of the match input
+const NIN: usize = NCTX * 2 + NSTRIDE + 2;
+const STRIDE_IN: usize = NCTX * 2; // first stride input index
+const MATCH_IN: usize = NCTX * 2 + NSTRIDE; // match input index
 const BIAS_IN: usize = NIN - 1;
 
 // ---------------------------------------------------------------------------
@@ -175,6 +193,14 @@ pub struct Predictor {
     hist: [u8; 6],
     word_hash: u32,
 
+    // Sparse stride models (single-rate u16 counters). Small, cache-resident
+    // tables: stride contexts are low-cardinality (one or two sample bytes), so
+    // a big table would only add cache misses without improving ratio.
+    ts: [Vec<u16>; NSTRIDE],
+    stride_mask: u32,
+    stride_base: [u32; NSTRIDE],
+    stride_idx: [usize; NSTRIDE],
+
     // Per-byte base hashes for the 5 hashed models.
     hbase: [u32; 5],
     // Slot indices chosen for the current bit (for the update step).
@@ -213,6 +239,10 @@ impl Predictor {
         let _ = stretch(2048);
         let hbits = table_bits(n);
         let hsize = 1usize << hbits;
+        // Stride tables are capped smaller than the main tables: big enough to
+        // avoid heavy collisions on 2-sample contexts, small enough to stay
+        // cache-friendly on text where these models are mostly dead weight.
+        let ssize = hsize.min(1 << 20);
         // The match table can be a touch larger; it stores one u32 per slot.
         let mbits = table_bits(n).min(HBITS_MAX);
         let msize = 1usize << mbits;
@@ -226,6 +256,15 @@ impl Predictor {
                 vec![DualCounter::INIT; hsize],
                 vec![DualCounter::INIT; hsize],
             ],
+            ts: [
+                vec![32768u16; ssize],
+                vec![32768u16; ssize],
+                vec![32768u16; ssize],
+                vec![32768u16; ssize],
+            ],
+            stride_mask: (ssize as u32) - 1,
+            stride_base: [0; NSTRIDE],
+            stride_idx: [0; NSTRIDE],
             hist: [0; 6],
             word_hash: 0,
             hbase: [0; 5],
@@ -273,6 +312,13 @@ impl Predictor {
             let c = self.th[k][slot];
             self.tx[4 + k * 2] = stretch((c.fast >> 4) as i32);
             self.tx[5 + k * 2] = stretch((c.slow >> 4) as i32);
+        }
+
+        // --- sparse stride models ---------------------------------------
+        for k in 0..NSTRIDE {
+            let slot = ((self.stride_base[k] ^ cmul) & self.stride_mask) as usize;
+            self.stride_idx[k] = slot;
+            self.tx[STRIDE_IN + k] = stretch((self.ts[k][slot] >> 4) as i32);
         }
 
         // --- match model -------------------------------------------------
@@ -336,6 +382,9 @@ impl Predictor {
         self.t1[self.idx[1]].update(bit);
         for k in 0..5 {
             self.th[k][self.idx[k + 2]].update(bit);
+        }
+        for k in 0..NSTRIDE {
+            counter_update(&mut self.ts[k][self.stride_idx[k]], bit);
         }
 
         // Mixer weights: gradient step on coding error for both views.
@@ -422,6 +471,18 @@ impl Predictor {
         self.hbase[2] = hash_ctx(&self.hist[0..4], 4);
         self.hbase[3] = hash_ctx(&self.hist[0..6], 6);
         self.hbase[4] = self.word_hash.wrapping_mul(PR1) ^ 0xABCD_1234;
+
+        // Stride bases: predict the upcoming byte (at index buf.len()) from the
+        // same lane of the previous one/two samples `stride` bytes back.
+        let n = self.buf.len();
+        for (k, &s) in STRIDES.iter().enumerate() {
+            let b1 = if n >= s { self.buf[n - s] as u32 } else { 0 };
+            let b2 = if n >= 2 * s { self.buf[n - 2 * s] as u32 } else { 0 };
+            let mut h = (s as u32).wrapping_mul(PR1).wrapping_add(0x55AA_33CC);
+            h = (h ^ (b1 + 1)).wrapping_mul(PR1);
+            h = (h ^ (b2 + 1)).wrapping_mul(PR1);
+            self.stride_base[k] = h ^ (h >> 15);
+        }
     }
 
     /// Hash of the last `MATCH_MIN` committed bytes.
