@@ -76,10 +76,18 @@ jobs:
         if: matrix.name == 'windows'
         shell: pwsh
         run: |
-          choco install innosetup --no-progress -y
+          $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
-            "/DMyAppVersion=$env:CPGC_VERSION" installer\cpgc.iss
+          choco install innosetup --no-progress -y
+          # Locate ISCC.exe regardless of the exact Inno Setup version folder.
+          $iscc = Get-ChildItem -Path `
+            "C:\Program Files (x86)\Inno Setup*","C:\Program Files\Inno Setup*" `
+            -Filter ISCC.exe -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $iscc) { throw "ISCC.exe not found after installing Inno Setup" }
+          Write-Host "Using $iscc"
+          & $iscc "/DMyAppVersion=$env:CPGC_VERSION" installer\cpgc.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE" }
           Compress-Archive -Path target\release\cpgc.exe     -DestinationPath dist\cpgc-cli-windows.zip -Force
           Compress-Archive -Path target\release\cpgc-gui.exe -DestinationPath dist\cpgc-gui-windows.zip -Force
 

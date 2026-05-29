@@ -18,7 +18,10 @@ OutputDir=dist
 OutputBaseFilename=CPGC-Setup
 Compression=lzma2
 SolidCompression=yes
-ArchitecturesInstallIn64BitMode=x64compatible
+; `x64` is accepted by every Inno Setup 6.x (it is the deprecated alias of the
+; newer `x64compatible`, which only exists in 6.3+). Using it keeps the script
+; compatible with whatever version the CI runner installs.
+ArchitecturesInstallIn64BitMode=x64
 WizardStyle=modern
 
 [Tasks]
