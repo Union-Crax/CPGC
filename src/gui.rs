@@ -9,7 +9,6 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use eframe::egui;
@@ -51,6 +50,12 @@ struct Entry {
     size: u64,
 }
 
+/// State for browsing *inside* an opened archive (7-Zip style).
+struct ArchiveView {
+    path: PathBuf,
+    entries: Vec<(String, u64)>, // member name, original size
+}
+
 #[derive(PartialEq)]
 enum StatusKind {
     Info,
@@ -68,7 +73,6 @@ struct Job {
     rx: Receiver<JobMsg>,
     label: String,
     progress: f32,
-    started: Instant,
 }
 
 struct CpgcApp {
@@ -81,6 +85,10 @@ struct CpgcApp {
     status: String,
     status_kind: StatusKind,
     job: Option<Job>,
+    // When Some, the file list shows the contents of this archive instead of
+    // the directory, and `arc_selected` tracks ticked member names.
+    archive: Option<ArchiveView>,
+    arc_selected: BTreeSet<String>,
 }
 
 impl CpgcApp {
@@ -92,9 +100,11 @@ impl CpgcApp {
             level: 5,
             out_name: "archive.cpgc".to_string(),
             extract_dest: String::new(),
-            status: "Ready. Tick items to compress, or pick an archive to extract.".to_string(),
+            status: "Ready. Tick items to compress, or open an archive to browse it.".to_string(),
             status_kind: StatusKind::Info,
             job: None,
+            archive: None,
+            arc_selected: BTreeSet::new(),
         };
         app.refresh();
         app
@@ -131,6 +141,91 @@ impl CpgcApp {
             self.selected.clear();
             self.refresh();
         }
+    }
+
+    /// Open an archive and show its members (does not decompress for solid
+    /// archives — the table is read directly).
+    fn open_archive(&mut self, path: PathBuf) {
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                self.set_status(StatusKind::Err, format!("cannot read archive: {e}"));
+                return;
+            }
+        };
+        let view = if data.starts_with(b"CPAS") {
+            match SolidArchive::list(&data) {
+                Ok(entries) => ArchiveView { path: path.clone(), entries },
+                Err(e) => {
+                    self.set_status(StatusKind::Err, format!("{e:#}"));
+                    return;
+                }
+            }
+        } else if data.starts_with(b"CPGC") {
+            // Single-file archive: present the one original file it holds.
+            let orig = if data.len() >= 14 {
+                u64::from_le_bytes(data[6..14].try_into().unwrap())
+            } else {
+                0
+            };
+            let name = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "file".to_string());
+            ArchiveView { path: path.clone(), entries: vec![(name, orig)] }
+        } else {
+            self.set_status(StatusKind::Err, "not a CPGC archive");
+            return;
+        };
+        let n = view.entries.len();
+        self.archive = Some(view);
+        self.arc_selected.clear();
+        self.extract_dest.clear();
+        self.set_status(StatusKind::Info, format!("Opened {} ({} file(s))", file_name(&path), n));
+    }
+
+    fn close_archive(&mut self) {
+        self.archive = None;
+        self.arc_selected.clear();
+        self.refresh();
+    }
+
+    /// Extract members of the open archive. `only_selected` limits to ticked
+    /// members; otherwise everything is extracted.
+    fn start_extract_members(&mut self, only_selected: bool) {
+        if self.busy() {
+            return;
+        }
+        let Some(av) = &self.archive else { return };
+        if only_selected && self.arc_selected.is_empty() {
+            return;
+        }
+        let archive = av.path.clone();
+        let base = archive
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "extracted".to_string());
+        let parent = archive.parent().unwrap_or(&self.cwd).to_path_buf();
+        let dest = if self.extract_dest.trim().is_empty() {
+            parent.join(format!("{base}_extracted"))
+        } else {
+            parent.join(self.extract_dest.trim())
+        };
+        let wanted = if only_selected {
+            Some(self.arc_selected.clone())
+        } else {
+            None
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let label = format!(
+            "Extracting {} from {}",
+            if only_selected { format!("{} file(s)", self.arc_selected.len()) } else { "all".into() },
+            file_name(&archive)
+        );
+        self.set_status(StatusKind::Info, label.clone());
+        spawn_extract_members(archive, dest, wanted, tx);
+        self.job = Some(Job { rx, label, progress: 0.0 });
     }
 
     fn set_status(&mut self, kind: StatusKind, msg: impl Into<String>) {
@@ -183,27 +278,7 @@ impl CpgcApp {
         let label = format!("Compressing {} item(s) → {}", inputs.len(), out);
         self.set_status(StatusKind::Info, label.clone());
         spawn_compress(inputs, output, level, tx);
-        self.job = Some(Job { rx, label, progress: 0.0, started: Instant::now() });
-    }
-
-    fn start_extract(&mut self, archive: PathBuf) {
-        if self.busy() {
-            return;
-        }
-        let base = archive
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "extracted".to_string());
-        let dest = if self.extract_dest.trim().is_empty() {
-            self.cwd.join(format!("{base}_extracted"))
-        } else {
-            self.cwd.join(self.extract_dest.trim())
-        };
-        let (tx, rx) = std::sync::mpsc::channel();
-        let label = format!("Extracting {}", file_name(&archive));
-        self.set_status(StatusKind::Info, label.clone());
-        spawn_extract(archive, dest, tx);
-        self.job = Some(Job { rx, label, progress: 0.0, started: Instant::now() });
+        self.job = Some(Job { rx, label, progress: 0.0 });
     }
 
     fn start_verify(&mut self, archive: PathBuf) {
@@ -214,7 +289,7 @@ impl CpgcApp {
         let label = format!("Verifying {}", file_name(&archive));
         self.set_status(StatusKind::Info, label.clone());
         spawn_verify(archive, tx);
-        self.job = Some(Job { rx, label, progress: 0.0, started: Instant::now() });
+        self.job = Some(Job { rx, label, progress: 0.0 });
     }
 }
 
@@ -239,47 +314,94 @@ impl CpgcApp {
     fn top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.heading("📦 CPGC");
-                ui.separator();
-
-                let busy = self.busy();
-                ui.add_enabled_ui(!busy, |ui| {
-                    if ui.button("⬆ Up").clicked() {
-                        if let Some(parent) = self.cwd.parent() {
-                            self.navigate(parent.to_path_buf());
-                        }
-                    }
-                });
-
-                ui.label(format!("{} selected", self.selected.len()));
-                ui.separator();
-
-                ui.label("Level");
-                egui::ComboBox::from_id_source("level")
-                    .selected_text(level_label(self.level))
-                    .show_ui(ui, |ui| {
-                        for lvl in 1u8..=9 {
-                            ui.selectable_value(&mut self.level, lvl, level_label(lvl));
-                        }
-                    });
-
-                ui.separator();
-                ui.label("Output");
-                ui.add(egui::TextEdit::singleline(&mut self.out_name).desired_width(160.0));
-
-                ui.add_enabled_ui(!busy && !self.selected.is_empty(), |ui| {
-                    if ui.button("🗜 Compress").clicked() {
-                        self.start_compress();
-                    }
-                });
-            });
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                ui.label("📂");
-                ui.monospace(self.cwd.to_string_lossy());
-            });
+            if self.archive.is_some() {
+                self.archive_toolbar(ui);
+            } else {
+                self.files_toolbar(ui);
+            }
             ui.add_space(4.0);
+        });
+    }
+
+    fn files_toolbar(&mut self, ui: &mut egui::Ui) {
+        let busy = self.busy();
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("📦 CPGC");
+            ui.separator();
+            ui.add_enabled_ui(!busy, |ui| {
+                if ui.button("⬆ Up").clicked() {
+                    if let Some(parent) = self.cwd.parent() {
+                        self.navigate(parent.to_path_buf());
+                    }
+                }
+            });
+            ui.label(format!("{} selected", self.selected.len()));
+            ui.separator();
+
+            ui.label("Level");
+            egui::ComboBox::from_id_source("level")
+                .selected_text(level_label(self.level))
+                .show_ui(ui, |ui| {
+                    for lvl in 1u8..=9 {
+                        ui.selectable_value(&mut self.level, lvl, level_label(lvl));
+                    }
+                });
+
+            ui.separator();
+            ui.label("Output");
+            ui.add(egui::TextEdit::singleline(&mut self.out_name).desired_width(160.0));
+
+            ui.add_enabled_ui(!busy && !self.selected.is_empty(), |ui| {
+                if ui.button("🗜 Compress").clicked() {
+                    self.start_compress();
+                }
+            });
+        });
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.label("📂");
+            ui.monospace(self.cwd.to_string_lossy());
+        });
+    }
+
+    fn archive_toolbar(&mut self, ui: &mut egui::Ui) {
+        let busy = self.busy();
+        let (name, n) = self
+            .archive
+            .as_ref()
+            .map(|a| (file_name(&a.path), a.entries.len()))
+            .unwrap_or_default();
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("🗜 Archive");
+            ui.separator();
+            ui.add_enabled_ui(!busy, |ui| {
+                if ui.button("✖ Close").clicked() {
+                    self.close_archive();
+                }
+            });
+            ui.label(format!("{} selected of {}", self.arc_selected.len(), n));
+            ui.separator();
+            ui.label("Extract to");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.extract_dest)
+                    .hint_text(format!("{}_extracted", strip_ext(&name)))
+                    .desired_width(180.0),
+            );
+            ui.add_enabled_ui(!busy && !self.arc_selected.is_empty(), |ui| {
+                if ui.button("⬇ Extract selected").clicked() {
+                    self.start_extract_members(true);
+                }
+            });
+            ui.add_enabled_ui(!busy, |ui| {
+                if ui.button("⬇ Extract all").clicked() {
+                    self.start_extract_members(false);
+                }
+            });
+        });
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.label("🗜");
+            ui.monospace(&name);
         });
     }
 
@@ -306,10 +428,18 @@ impl CpgcApp {
     }
 
     fn file_list(&mut self, ctx: &egui::Context) {
+        if self.archive.is_some() {
+            self.archive_list(ctx);
+        } else {
+            self.dir_list(ctx);
+        }
+    }
+
+    fn dir_list(&mut self, ctx: &egui::Context) {
         // Actions deferred until after the immutable iteration over entries.
         let mut nav_to: Option<PathBuf> = None;
         let mut toggle: Option<PathBuf> = None;
-        let mut extract: Option<PathBuf> = None;
+        let mut open: Option<PathBuf> = None;
         let mut verify: Option<PathBuf> = None;
         let busy = self.busy();
 
@@ -357,12 +487,12 @@ impl CpgcApp {
                                 ui.monospace(human_size(e.size));
                             }
 
-                            // Per-row actions for archives.
+                            // Per-row actions for archives: open to browse, or verify.
                             ui.horizontal(|ui| {
                                 if e.is_archive {
                                     ui.add_enabled_ui(!busy, |ui| {
-                                        if ui.button("Extract").clicked() {
-                                            extract = Some(e.path.clone());
+                                        if ui.button("Open").clicked() {
+                                            open = Some(e.path.clone());
                                         }
                                         if ui.button("Verify").clicked() {
                                             verify = Some(e.path.clone());
@@ -384,11 +514,55 @@ impl CpgcApp {
         if let Some(p) = nav_to {
             self.navigate(p);
         }
-        if let Some(p) = extract {
-            self.start_extract(p);
+        if let Some(p) = open {
+            self.open_archive(p);
         }
         if let Some(p) = verify {
             self.start_verify(p);
+        }
+    }
+
+    fn archive_list(&mut self, ctx: &egui::Context) {
+        let mut toggle: Option<String> = None;
+        let busy = self.busy();
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                egui::Grid::new("members")
+                    .num_columns(3)
+                    .striped(true)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.strong("");
+                        ui.strong("Name");
+                        ui.strong("Size");
+                        ui.end_row();
+
+                        if let Some(av) = &self.archive {
+                            for (name, size) in &av.entries {
+                                let mut sel = self.arc_selected.contains(name);
+                                if ui
+                                    .add_enabled(!busy, egui::Checkbox::without_text(&mut sel))
+                                    .changed()
+                                {
+                                    toggle = Some(name.clone());
+                                }
+                                let label = format!("📄 {name}");
+                                if ui.add(egui::SelectableLabel::new(sel, label)).clicked() {
+                                    toggle = Some(name.clone());
+                                }
+                                ui.monospace(human_size(*size));
+                                ui.end_row();
+                            }
+                        }
+                    });
+            });
+        });
+
+        if let Some(name) = toggle {
+            if !self.arc_selected.remove(&name) {
+                self.arc_selected.insert(name);
+            }
         }
     }
 }
@@ -461,37 +635,52 @@ fn do_compress(
     ))
 }
 
-fn spawn_extract(archive: PathBuf, dest: PathBuf, tx: Sender<JobMsg>) {
+fn spawn_extract_members(
+    archive: PathBuf,
+    dest: PathBuf,
+    wanted: Option<BTreeSet<String>>,
+    tx: Sender<JobMsg>,
+) {
     std::thread::spawn(move || {
-        let res = do_extract(&archive, &dest).map_err(|e| format!("{e:#}"));
+        let res = do_extract_members(&archive, &dest, wanted.as_ref()).map_err(|e| format!("{e:#}"));
         let _ = tx.send(JobMsg::Done(res));
     });
 }
 
-fn do_extract(archive: &Path, dest: &Path) -> Result<String> {
+fn do_extract_members(
+    archive: &Path,
+    dest: &Path,
+    wanted: Option<&BTreeSet<String>>,
+) -> Result<String> {
     let data = std::fs::read(archive)?;
     std::fs::create_dir_all(dest)?;
+    let want = |name: &str| wanted.map(|w| w.contains(name)).unwrap_or(true);
+
     if data.starts_with(b"CPAS") {
+        // Solid: the whole stream must be decompressed, then chosen members written.
         let files = SolidArchive::unpack(&data)?;
+        let mut count = 0usize;
         for (name, bytes) in &files {
-            let safe = sanitize_rel(name);
-            let out = dest.join(&safe);
+            if !want(name) {
+                continue;
+            }
+            let out = dest.join(sanitize_rel(name));
             if let Some(parent) = out.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&out, bytes)?;
+            count += 1;
         }
-        Ok(format!(
-            "✔ extracted {} file(s) → {}",
-            files.len(),
-            file_name(dest)
-        ))
+        Ok(format!("✔ extracted {} file(s) → {}", count, file_name(dest)))
     } else {
         let recovered = codec::decompress(&data)?;
         let stem = archive
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "recovered".to_string());
+        if !want(&stem) {
+            return Ok("nothing selected".to_string());
+        }
         std::fs::write(dest.join(&stem), recovered)?;
         Ok(format!("✔ extracted 1 file → {}", file_name(dest)))
     }
@@ -539,6 +728,16 @@ fn file_name(p: &Path) -> String {
         .unwrap_or_else(|| p.to_string_lossy().to_string())
 }
 
+/// Strip a trailing `.cpgc` / `.cpas` extension from a file name.
+fn strip_ext(name: &str) -> String {
+    let lower = name.to_lowercase();
+    if lower.ends_with(".cpgc") || lower.ends_with(".cpas") {
+        name[..name.len() - 5].to_string()
+    } else {
+        name.to_string()
+    }
+}
+
 fn human_size(n: u64) -> String {
     const KB: f64 = 1024.0;
     let f = n as f64;
@@ -565,4 +764,48 @@ fn sanitize_rel(name: &str) -> PathBuf {
         out.push("file");
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_selected_members_only() {
+        let dir = tempfile::tempdir().unwrap();
+        // Build a solid archive with three members.
+        let files: Vec<(&str, &[u8])> = vec![
+            ("a.txt", b"alpha alpha alpha"),
+            ("sub/b.bin", &[1u8, 2, 3, 4, 5, 6]),
+            ("c.log", b"gamma gamma gamma gamma"),
+        ];
+        let packed = SolidArchive::pack(&files, 5).unwrap();
+        let arc = dir.path().join("test.cpas");
+        std::fs::write(&arc, &packed).unwrap();
+
+        // Extract only the two we want; the third must NOT appear.
+        let mut wanted = BTreeSet::new();
+        wanted.insert("a.txt".to_string());
+        wanted.insert("sub/b.bin".to_string());
+        let dest = dir.path().join("out");
+        do_extract_members(&arc, &dest, Some(&wanted)).unwrap();
+
+        assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"alpha alpha alpha");
+        assert_eq!(std::fs::read(dest.join("sub/b.bin")).unwrap(), vec![1, 2, 3, 4, 5, 6]);
+        assert!(!dest.join("c.log").exists(), "unselected member was extracted");
+    }
+
+    #[test]
+    fn extract_all_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let files: Vec<(&str, &[u8])> = vec![("x", b"one"), ("y", b"two")];
+        let packed = SolidArchive::pack(&files, 5).unwrap();
+        let arc = dir.path().join("all.cpas");
+        std::fs::write(&arc, &packed).unwrap();
+
+        let dest = dir.path().join("all_out");
+        do_extract_members(&arc, &dest, None).unwrap();
+        assert_eq!(std::fs::read(dest.join("x")).unwrap(), b"one");
+        assert_eq!(std::fs::read(dest.join("y")).unwrap(), b"two");
+    }
 }

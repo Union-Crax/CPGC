@@ -147,13 +147,18 @@ cpgc gui                       # opens a desktop window
 cpgc gui --dir /data           # start in a specific folder
 ```
 
-`cpgc gui` opens a real native window (egui/eframe — no browser): browse
-folders, tick files or directories, choose a compression level, and click
-**Compress** to make a `.cpgc` single-file or `.cpas` solid archive. Each
-archive row has **Extract** and **Verify** buttons. Long operations run on a
-background thread with a live progress bar. It is cross-platform
-(Windows/macOS/Linux) and needs a graphical desktop to run; on a headless
-machine it exits with a clear "no display" message — use the CLI there.
+`cpgc gui` opens a real native window (egui/eframe — no browser):
+
+- **Browse** folders, tick files or directories, choose a compression level,
+  and click **Compress** to make a `.cpgc` single-file or `.cpas` solid archive.
+- **Open an archive** (like opening a folder) to browse its contents, then tick
+  individual members and **Extract selected**, or **Extract all**. **Verify**
+  checks an archive decodes correctly.
+- Long operations run on a background thread with a live progress bar.
+
+It is cross-platform (Windows/macOS/Linux) and needs a graphical desktop to
+run; on a headless machine it exits with a clear "no display" message — use the
+CLI there.
 
 ---
 
