@@ -11,6 +11,12 @@
 AppName=CPGC
 AppVersion={#MyAppVersion}
 AppPublisher=CPGC
+; Resolve relative Source/Output paths against the repo root, not the
+; installer\ directory that holds this script. {#SourcePath} is the script's
+; own directory (with a trailing backslash), so `..` climbs up to the root.
+; This lets CI invoke `iscc installer\cpgc.iss` from the root and still find
+; target\release\*.exe and README.md.
+SourceDir={#SourcePath}..
 DefaultDirName={autopf}\CPGC
 DefaultGroupName=CPGC
 DisableProgramGroupPage=yes
