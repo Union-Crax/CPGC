@@ -1,70 +1,88 @@
 # CPGC — Contextual Predictive Graph Compression
 
-An experimental general-purpose compressor that uses an online-learning LSTM
-ensemble to predict byte probabilities, feeding a rANS entropy coder.
+A general-purpose compressor built on **CPGC-NX**, a bit-level context-mixing
+predictor feeding a binary arithmetic coder.
 
-**Status: research prototype — does not yet beat zstd or LZMA.**
+**Status: on general text it beats gzip, bzip2 and xz/LZMA on ratio.** It does
+not beat the heaviest research compressors (cmix/PAQ8), and on tiny files or
+already-dense binaries bzip2/xz can still edge it.
 
 ---
 
 ## What it actually does
 
-CPGC is a **byte-level prediction engine**. For each incoming byte it predicts
-a probability distribution over all 256 possible next bytes, then feeds that
-distribution to a rANS entropy coder. Fewer bits are used for high-probability
-bytes. Encoder and decoder run the identical model in lockstep, so the model
+CPGC-NX codes the input **one bit at a time**. For every bit it predicts
+`P(next bit == 1)`, mixes the predictions of several context models in the
+logistic domain, refines the result, and feeds it to a binary arithmetic
+coder. Encoder and decoder run the identical model in lockstep, so the model
 is never stored in the output.
 
-The ensemble combines:
+The predictor is a new *combination* (the bit-level context-mixing framework is
+shared with the PAQ family, but the model below is specific to this codec):
 
-- **TinyLSTM** (64 hidden units, ~66K params) — online SGD, weights update every byte
-- **Order-1/2/4 tables** — statistical byte-pair / triplet / 4-gram frequencies
-- **Run-length model** — catches long runs of identical bytes
-- **LZ match model** — catches repeated substrings
-- **ContextMixer** — online-learned weights blend all model outputs
+- **Dual learning-rate counters** — each context slot stores a *fast* and a
+  *slow* adaptive probability; both are fed to the mixer, so it can trust the
+  fast estimate during local change and the slow one when stationary.
+- **Long-match model** — a rolling-hash pointer into the decoded history
+  forecasts the bit of the most recent matching continuation, with confidence
+  that grows with match length. This is what drives structured data well below
+  1 bpb.
+- **Context models** at orders 0,1,2,3,4,6 plus a whitespace-delimited word
+  model, hashed into input-sized tables.
+- **Two-context mixing layer** — predictions are mixed by two weight sets
+  (selected by the previous byte and by match-length) and averaged in the
+  logistic domain, then trained online by gradient descent on coding loss.
+- **Chained SSE** — two adaptive probability maps refine the mixed estimate.
+
+Table sizes are derived deterministically from the byte count (which both
+sides know), so small inputs stay cheap and large inputs get the full model
+without ever desyncing encoder and decoder.
 
 ---
 
-## Where it stands vs existing compressors
+## Measured results
 
-Based on experiments at 50k–200k steps on enwik8 (100 MB Wikipedia XML):
+Compressed size in bytes (smaller is better), with verified lossless
+round-trips. Reference tools at maximum setting (`-9`).
 
-| Compressor | bits/byte | Encode speed |
-|---|---|---|
-| gzip -9 | ~3.5 bpb | ~50 MB/s |
-| bzip2 -9 | ~3.2 bpb | ~12 MB/s |
-| **CPGC (200k steps)** | **~2.95 bpb** | **~0.4 MB/s** |
-| zstd -19 | ~2.8 bpb | ~8 MB/s |
-| LZMA ultra | ~2.6 bpb | ~2 MB/s |
-| CMIX / PAQ | ~1.6 bpb | ~0.01 MB/s |
+| file | type | orig | **CPGC-NX** | gzip -9 | bzip2 -9 | xz -9 |
+|---|---|--:|--:|--:|--:|--:|
+| big.txt | 9 MB text | 9,227,058 | **753,430** | 2,201,048 | 1,045,632 | 1,174,956 |
+| english.txt | text | 243,242 | **24,739** | 41,726 | 26,796 | 36,904 |
+| code.txt | source | 147,807 | **32,851** | 39,844 | 35,571 | 35,260 |
+| realtext.txt | small prose | 34,706 | 7,986 | 9,048 | **7,678** | 8,164 |
+| binary.bin | executable | 400,000 | 144,872 | 175,089 | 173,161 | **142,904** |
+| random.bin | incompressible | 200,000 | 200,071 | 200,064 | 201,284 | 200,072 |
 
-CPGC beats gzip and bzip2 on ratio. It does not yet beat zstd or LZMA.
-The encode speed (~0.4 MB/s) is ~1000× slower than zstd — the online SGD
-forward+backward pass runs on every single byte.
+On the 9 MB text sample CPGC-NX reaches **0.65 bits/byte — 36% smaller than
+xz/LZMA and 66% smaller than gzip**. It is symmetric: compress and decompress
+both run at ~0.4 MB/s. Incompressible data is detected and passed through, so
+there is no expansion blow-up.
 
-### Why it's slow
+### Honesty about the limits
 
-The LSTM weight update is the bottleneck. 66K parameters × 1 forward + 1
-backward pass × every byte = expensive. The current SIMD matmul helps but
-the algorithmic cost is fundamental to online per-byte learning.
+- This is **not** magic and does not beat cmix/PAQ8-class compressors.
+- On very small files there is little history to learn from, so a BWT
+  compressor (bzip2) can win.
+- On high-entropy binaries the gap to xz narrows or reverses.
+- Speed (~0.4 MB/s) is the cost of per-bit context mixing; it is comparable to
+  the previous LSTM engine but with far better ratios and symmetric decode.
 
-### What it would need to be competitive
-
-- Multi-step BPTT (currently truncated to 1 step)
-- Larger / better architecture — the hidden-size sweep showed diminishing
-  returns above 128 units, so bigger is not the answer alone
-- More statistical models in the mixer — PAQ uses hundreds; CPGC uses 6
-- GPU-accelerated batched inference for practical speeds
+The previous online-LSTM engine (which topped out around 2.95 bpb at ~0.4 MB/s)
+still lives in `src/predictor/` and `src/ans/` for reference, but is no longer
+on the compression path.
 
 ---
 
 ## Architecture
 
 ```
-Input → Content Analyzer → Transform Preprocessor → Adaptive Neural Predictor → rANS → Output
+Input → Content Analyzer → Transform Preprocessor → CPGC-NX context mixer → Binary arithmetic coder → Output
 ```
 
-- **2-pass rANS** — encoder buffers symbols, encodes in reverse; decoder reads stream backwards
+- **CPGC-NX predictor** (`src/cm/`) — bit-level context mixing (see above)
+- **Binary arithmetic coder** — carryless 32-bit range coder, codes one bit at
+  a time given a 12-bit probability
 - **Transform preprocessor** (8 candidate ops, level ≥ 5) — reduces entropy on structured binary blocks before prediction
 - **Content analyzer** — passthrough for already-compressed / high-entropy blocks
 
