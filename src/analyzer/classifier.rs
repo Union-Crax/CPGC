@@ -1,6 +1,6 @@
 //! Region classifier: produces a map of preprocessing flags per 4KB window.
 
-use crate::analyzer::entropy::{entropy_bits, is_high_entropy};
+use crate::analyzer::entropy::{entropy_bits, is_truly_incompressible};
 use crate::analyzer::magic::is_incompressible;
 
 pub const WINDOW_SIZE: usize = 4096;
@@ -27,7 +27,7 @@ pub fn classify(data: &[u8]) -> Vec<Region> {
 
         let mut region = Region { offset: offset as u32, ..Default::default() };
 
-        if file_incompressible || is_high_entropy(window) {
+        if file_incompressible || is_truly_incompressible(window) {
             region.passthrough = true;
         } else {
             // Heuristic: if delta-encoding reduces entropy, flag it

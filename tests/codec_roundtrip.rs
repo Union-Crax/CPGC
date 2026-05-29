@@ -53,7 +53,7 @@ fn codec_header_magic_version() {
     // "test" = 4 bytes → 1 block
     let compressed = compress(b"test", 1).unwrap();
     assert_eq!(&compressed[0..4], b"CPGC", "magic bytes wrong");
-    assert_eq!(compressed[4], 2, "version should be 2");
+    assert_eq!(compressed[4], 4, "version should be 4");
     // flags at [5]; orig_len at [6..14]
     let len = u64::from_le_bytes(compressed[6..14].try_into().unwrap());
     assert_eq!(len, 4, "stored length wrong");

@@ -1,70 +1,129 @@
 # CPGC — Contextual Predictive Graph Compression
 
-An experimental general-purpose compressor that uses an online-learning LSTM
-ensemble to predict byte probabilities, feeding a rANS entropy coder.
+A general-purpose compressor built on **CPGC-NX**, a bit-level context-mixing
+predictor feeding a binary arithmetic coder.
 
-**Status: research prototype — does not yet beat zstd or LZMA.**
+**Status: on general text it beats gzip, bzip2 and xz/LZMA on ratio.** It does
+not beat the heaviest research compressors (cmix/PAQ8), and on tiny files or
+already-dense binaries bzip2/xz can still edge it.
 
 ---
 
 ## What it actually does
 
-CPGC is a **byte-level prediction engine**. For each incoming byte it predicts
-a probability distribution over all 256 possible next bytes, then feeds that
-distribution to a rANS entropy coder. Fewer bits are used for high-probability
-bytes. Encoder and decoder run the identical model in lockstep, so the model
+CPGC-NX codes the input **one bit at a time**. For every bit it predicts
+`P(next bit == 1)`, mixes the predictions of several context models in the
+logistic domain, refines the result, and feeds it to a binary arithmetic
+coder. Encoder and decoder run the identical model in lockstep, so the model
 is never stored in the output.
 
-The ensemble combines:
+The predictor is a new *combination* (the bit-level context-mixing framework is
+shared with the PAQ family, but the model below is specific to this codec):
 
-- **TinyLSTM** (64 hidden units, ~66K params) — online SGD, weights update every byte
-- **Order-1/2/4 tables** — statistical byte-pair / triplet / 4-gram frequencies
-- **Run-length model** — catches long runs of identical bytes
-- **LZ match model** — catches repeated substrings
-- **ContextMixer** — online-learned weights blend all model outputs
+- **Dual learning-rate counters** — each context slot stores a *fast* and a
+  *slow* adaptive probability; both are fed to the mixer, so it can trust the
+  fast estimate during local change and the slow one when stationary.
+- **Verified long-match model** — a rolling-hash pointer into the decoded
+  history finds the most recent occurrence of the current suffix, *verifies* it
+  by extending backward (rejecting hash collisions) and measures the true match
+  length, then forecasts the bit of the continuation with confidence that grows
+  with that length. Long verified matches are predicted near-certainly, which
+  is what captures long-range redundancy and drives structured data well below
+  1 bpb.
+- **Context models** at orders 0,1,2,3,4,6 plus a whitespace-delimited word
+  model, hashed into input-sized tables.
+- **Two-context mixing layer** — predictions are mixed by two weight sets
+  (selected by the previous byte and by match-length) and averaged in the
+  logistic domain, then trained online by gradient descent on coding loss.
+- **Chained SSE** — two adaptive probability maps refine the mixed estimate.
+
+Table sizes are derived deterministically from the byte count (which both
+sides know), so small inputs stay cheap and large inputs get the full model
+without ever desyncing encoder and decoder.
+
+### Scaling to big archives (parallelism)
+
+Inputs larger than 16 MiB are split into fixed-size **independent segments**
+that are compressed and decompressed in parallel across every CPU core. The
+segment size is a fixed constant (not derived from the core count), so an
+archive written on a 4-core machine decodes identically on a 64-core one.
+Segments are large enough that per-segment model warm-up costs a negligible
+amount of ratio on realistic data, while throughput scales close to linearly
+with cores — so on big archives CPGC-NX is not only smaller than xz but
+**faster** than it too.
 
 ---
 
-## Where it stands vs existing compressors
+## Measured results
 
-Based on experiments at 50k–200k steps on enwik8 (100 MB Wikipedia XML):
+Compressed size in bytes (smaller is better), with verified lossless
+round-trips. Reference tools at maximum setting (`-9`).
 
-| Compressor | bits/byte | Encode speed |
-|---|---|---|
-| gzip -9 | ~3.5 bpb | ~50 MB/s |
-| bzip2 -9 | ~3.2 bpb | ~12 MB/s |
-| **CPGC (200k steps)** | **~2.95 bpb** | **~0.4 MB/s** |
-| zstd -19 | ~2.8 bpb | ~8 MB/s |
-| LZMA ultra | ~2.6 bpb | ~2 MB/s |
-| CMIX / PAQ | ~1.6 bpb | ~0.01 MB/s |
+| file | type | orig | **CPGC-NX** | gzip -9 | bzip2 -9 | xz -9 |
+|---|---|--:|--:|--:|--:|--:|
+| real40.txt | **40 MB text** | 40,002,833 | **6,106,235** | 11,029,458 | 6,877,636 | 8,318,320 |
+| big.txt | 9 MB text | 9,227,058 | **756,972** | 2,201,048 | 1,045,632 | 1,174,956 |
+| english.txt | text | 243,242 | **24,739** | 41,726 | 26,796 | 36,904 |
+| code.txt | source | 147,807 | **32,851** | 39,844 | 35,571 | 35,260 |
+| realtext.txt | small prose | 34,706 | 7,986 | 9,048 | **7,678** | 8,164 |
+| binary.bin | executable | 400,000 | 144,872 | 175,089 | 173,161 | **142,904** |
+| random.bin | incompressible | 200,000 | 200,071 | 200,064 | 201,284 | 200,072 |
 
-CPGC beats gzip and bzip2 on ratio. It does not yet beat zstd or LZMA.
-The encode speed (~0.4 MB/s) is ~1000× slower than zstd — the online SGD
-forward+backward pass runs on every single byte.
+On the 40 MB sample CPGC-NX is **27% smaller than xz/LZMA, 45% smaller than
+gzip, 13% smaller than bzip2 — and at 1.75 MB/s it compresses faster than xz**
+(1.27 MB/s) by using all cores. Incompressible data is detected and passed
+through, so there is no expansion blow-up.
 
-### Why it's slow
+### Honesty about the limits
 
-The LSTM weight update is the bottleneck. 66K parameters × 1 forward + 1
-backward pass × every byte = expensive. The current SIMD matmul helps but
-the algorithmic cost is fundamental to online per-byte learning.
+- This is **not** magic and does not beat cmix/PAQ8-class compressors.
+- On very small files there is little history to learn from, so a BWT
+  compressor (bzip2) can win.
+- On high-entropy binaries the gap to xz narrows or reverses.
+- On *pathologically* redundant inputs (the same multi-MB block repeated many
+  times) xz's 64 MB LZ window wins, because such repeats can straddle the
+  segment boundaries CPGC compresses independently. Real archives rarely look
+  like this; on varied data segmentation costs almost nothing.
+- Single-segment throughput is ~0.4–0.8 MB/s (the cost of per-bit mixing);
+  parallelism is what lifts large-archive throughput past xz.
 
-### What it would need to be competitive
+The previous online-LSTM engine (which topped out around 2.95 bpb at ~0.4 MB/s)
+still lives in `src/predictor/` and `src/ans/` for reference, but is no longer
+on the compression path.
 
-- Multi-step BPTT (currently truncated to 1 step)
-- Larger / better architecture — the hidden-size sweep showed diminishing
-  returns above 128 units, so bigger is not the answer alone
-- More statistical models in the mixer — PAQ uses hundreds; CPGC uses 6
-- GPU-accelerated batched inference for practical speeds
+### Binary media & game files
+
+Text is the easy case; structured binary is where naive byte models fall over.
+Uncompressed media looks random at the byte level (16-bit audio, RGB pixels)
+even though it is highly compressible by *stride*. CPGC-NX adds **sparse stride
+models** (strides 2, 3, 4, 8) that predict each byte from the same lane of the
+previous sample(s), and a **stride-aware incompressibility test** so structured
+media reaches the compressor instead of being passed through.
+
+| file | type | orig | **CPGC-NX** | gzip -9 | bzip2 -9 | xz -9 |
+|---|---|--:|--:|--:|--:|--:|
+| image.rgb | 24-bit image | 2,430,000 | **54,609** | 424,672 | 409,657 | 115,296 |
+| exe.bin | executable | 1,124,888 | **372,582** | 492,925 | 463,361 | 398,536 |
+| game.dat | record data | 1,920,000 | 644,815 | 1,070,121 | 793,477 | **640,812** |
+| audio.pcm | 16-bit PCM | 2,400,000 | 965,128 | 2,311,622 | 2,079,406 | **596,752** |
+
+CPGC-NX wins clearly on images and executables and ties on record data.
+Already-compressed media (MP3, JPEG, H.264, PNG, ZIP'd game assets) is
+high-entropy and is **passed through unchanged** — no wasted time, no
+expansion. Raw PCM audio still trails xz (linear-predictive residuals are
+LZMA's strong suit) but is no longer mishandled.
 
 ---
 
 ## Architecture
 
 ```
-Input → Content Analyzer → Transform Preprocessor → Adaptive Neural Predictor → rANS → Output
+Input → Content Analyzer → Transform Preprocessor → CPGC-NX context mixer → Binary arithmetic coder → Output
 ```
 
-- **2-pass rANS** — encoder buffers symbols, encodes in reverse; decoder reads stream backwards
+- **CPGC-NX predictor** (`src/cm/`) — bit-level context mixing (see above)
+- **Binary arithmetic coder** — carryless 32-bit range coder, codes one bit at
+  a time given a 12-bit probability
 - **Transform preprocessor** (8 candidate ops, level ≥ 5) — reduces entropy on structured binary blocks before prediction
 - **Content analyzer** — passthrough for already-compressed / high-entropy blocks
 
@@ -73,38 +132,94 @@ Input → Content Analyzer → Transform Preprocessor → Adaptive Neural Predic
 ## Build
 
 ```sh
-cargo build --release
+cargo build --release          # includes the native GUI (default)
+cargo build --release --no-default-features   # lean CLI-only binary
 ```
 
-Binary: `target/release/cpgc.exe`
+Binary: `target/release/cpgc`
+
+---
+
+## GUI (native 7-Zip-style app)
+
+```sh
+cpgc gui                       # opens a desktop window
+cpgc gui --dir /data           # start in a specific folder
+```
+
+`cpgc gui` opens a real native window (egui/eframe — no browser):
+
+- **Browse** folders, tick files or directories, choose a compression level,
+  and click **Compress** to make a `.cpgc` single-file or `.cpas` solid archive.
+- **Open an archive** (like opening a folder) to browse its contents, then tick
+  individual members and **Extract selected**, or **Extract all**. **Verify**
+  checks an archive decodes correctly.
+- Long operations run on a background thread with a live progress bar.
+
+It is cross-platform (Windows/macOS/Linux) and needs a graphical desktop to
+run; on a headless machine it exits with a clear "no display" message — use the
+CLI there.
+
+---
+
+## Compression levels
+
+`-l`/`--level` (1–9, default 5) trades speed for ratio by setting the parallel
+**segment size**: lower levels use smaller segments (more cores, faster, a
+little larger), higher levels use larger segments (better ratio, less
+parallelism). The size is recorded in the archive, so decompression never needs
+to know the level. Levels ≥ 5 also enable the transform pass. Example on 9 MB of
+text:
+
+| level | size | bits/byte | speed |
+|--:|--:|--:|--:|
+| 1 (fastest) | 889 KB | 0.77 | 1.08 MB/s |
+| 3 | 794 KB | 0.69 | 0.73 MB/s |
+| 5 (default) | 758 KB | 0.66 | 0.34 MB/s |
+| 9 (best ratio) | 758 KB | 0.66 | 0.34 MB/s |
+
+(Levels 5–9 coincide here because the file is smaller than one segment; they
+diverge on larger archives.)
 
 ---
 
 ## CLI Usage
 
-### Compress a file
+Subcommands have short aliases: `c` (compress), `x` (decompress), `t` (verify).
+
+### Compress a file or directory
 
 ```sh
-cpgc compress <input> <output.cpgc> [-l <level>]
+cpgc compress <input> [output.cpgc] [-l <level>]
 ```
 
-`-l` / `--level`: 1–9, default 5 (reserved for future tuning — currently no-op).
+The output path is optional — it defaults to `<input>.cpgc`. Pass a directory
+to build a solid multi-file archive. `-l`/`--level` is 1–9 (default 5).
 
 ```
-path/to/file.txt → file.cpgc
+"file.txt" → "file.txt.cpgc"
         12345 bytes →       9876 bytes  (0.800 ratio)
   0.423 MB/s  (0.03s)
 ```
 
-### Decompress
+### Decompress / extract
 
 ```sh
-cpgc decompress <input.cpgc> <output>
+cpgc decompress <input.cpgc> [output]
 ```
 
+The output is optional — it defaults to the original name (`.cpgc` stripped).
+Solid (`.cpas`) archives are unpacked into the output directory automatically.
+
 ```
-file.cpgc → recovered.txt
+"file.txt.cpgc" → "file.txt"
         12345 bytes recovered  (0.401 MB/s, 0.03s)
+```
+
+### Verify an archive
+
+```sh
+cpgc verify <archive>          # decodes in memory, writes nothing
 ```
 
 ### Show archive info

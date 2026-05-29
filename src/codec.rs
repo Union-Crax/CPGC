@@ -22,13 +22,12 @@
 
 use anyhow::{anyhow, Result};
 
-use crate::ans::{decode::AnsDecoder, encode::AnsEncoder};
 use crate::analyzer::classifier::{classify, WINDOW_SIZE};
-use crate::predictor::mixer::ContextMixer;
+use crate::cm;
 use crate::transform::search::{find_best_transform, CANDIDATES};
 
 const MAGIC: &[u8; 4] = b"CPGC";
-const VERSION: u8 = 2;
+const VERSION: u8 = 4;
 const TAG_NORMAL: u8 = 0x00;
 const TAG_PASSTHROUGH: u8 = 0xFF;
 
@@ -51,13 +50,14 @@ pub fn compress_with_progress(
     let n_blocks = if n == 0 { 0usize } else { (n + WINDOW_SIZE - 1) / WINDOW_SIZE };
 
     // ------------------------------------------------------------------
-    // Step 1: Classify blocks and pre-compute transforms (level ≥ 5 only)
+    // Step 1: Classify blocks; pass through incompressible blocks (every level)
+    // and search transforms on structured ones (level ≥ 5).
     // ------------------------------------------------------------------
     let mut block_tags: Vec<u8> = vec![TAG_NORMAL; n_blocks];
     // Transformed data for transform-tagged blocks; None = use original chunk.
     let mut block_transformed: Vec<Option<Vec<u8>>> = vec![None; n_blocks];
 
-    if level >= 5 && n > 0 {
+    if n > 0 {
         let regions = classify(input);
         for (block_idx, region) in regions.iter().enumerate() {
             if block_idx >= n_blocks { break; }
@@ -66,8 +66,10 @@ pub fn compress_with_progress(
             let chunk = &input[start..end];
 
             if region.passthrough {
+                // Passing incompressible data through guards against expansion
+                // at every level, not just ≥ 5.
                 block_tags[block_idx] = TAG_PASSTHROUGH;
-            } else if region.use_transform {
+            } else if level >= 5 && region.use_transform {
                 if let Some((op, transformed)) = find_best_transform(chunk) {
                     if let Some(tag) = op_to_tag(op) {
                         block_tags[block_idx] = tag;
@@ -100,13 +102,8 @@ pub fn compress_with_progress(
     }
 
     // ------------------------------------------------------------------
-    // Step 3: LSTM + ANS encode the non-passthrough stream
+    // Step 3: CPGC-NX context-mixing encode of the non-passthrough stream
     // ------------------------------------------------------------------
-    let pretrained = std::env::var_os("CPGC_WEIGHTS")
-        .and_then(|p| std::fs::read(p).ok());
-    let uniform = [1.0f32 / 256.0; 256];
-    let mut mixer = ContextMixer::new_with_pretrained(0.005, pretrained.as_deref());
-    let mut enc = AnsEncoder::new(&uniform);
     // Progress is reported against the *full* input size so passthrough-heavy
     // files (e.g. already-compressed executables) show real MB/total MB.
     let grand_total = n.max(1);
@@ -114,17 +111,8 @@ pub fn compress_with_progress(
     if pt_done > 0 {
         on_progress(pt_done.min(grand_total), grand_total);
     }
-    for (i, &byte) in to_encode.iter().enumerate() {
-        let dist = mixer.predict();
-        enc.update_table(&dist);
-        enc.encode(byte);
-        mixer.update(byte);
-        if i & 0xFFFF == 0xFFFF {
-            on_progress((pt_done + i + 1).min(grand_total), grand_total);
-        }
-    }
+    let ans_payload = cm::encode(&to_encode, level);
     on_progress(grand_total, grand_total);
-    let ans_payload = enc.finish();
 
     // ------------------------------------------------------------------
     // Step 4: Assemble output
@@ -198,22 +186,7 @@ pub fn decompress(input: &[u8]) -> Result<Vec<u8>> {
     }).sum();
 
     let ans_decoded: Vec<u8> = if ans_byte_count > 0 {
-        let pretrained = std::env::var_os("CPGC_WEIGHTS")
-            .and_then(|p| std::fs::read(p).ok());
-        let uniform = [1.0f32 / 256.0; 256];
-        let mut mixer = ContextMixer::new_with_pretrained(0.005, pretrained.as_deref());
-        let mut dec = AnsDecoder::new(ans_payload, &uniform)
-            .ok_or_else(|| anyhow!("ANS decoder: payload too short"))?;
-        let mut buf = Vec::with_capacity(ans_byte_count);
-        for _ in 0..ans_byte_count {
-            let dist = mixer.predict();
-            dec.update_table(&dist);
-            let byte = dec.decode()
-                .ok_or_else(|| anyhow!("ANS decoder exhausted before expected length"))?;
-            buf.push(byte);
-            mixer.update(byte);
-        }
-        buf
+        cm::decode(ans_payload, ans_byte_count)
     } else {
         Vec::new()
     };
