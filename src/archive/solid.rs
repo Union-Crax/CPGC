@@ -42,7 +42,31 @@ impl SolidArchive {
         level: u8,
         on_progress: impl Fn(usize, usize),
     ) -> Result<Vec<u8>> {
-        // Build file table
+        let (table, combined) = Self::build_table(files);
+        let payload = crate::codec::compress_with_progress(&combined, level, on_progress)?;
+        let mut out = Vec::with_capacity(table.len() + payload.len());
+        out.extend_from_slice(&table);
+        out.extend_from_slice(&payload);
+        Ok(out)
+    }
+
+    /// Same as `pack` but with a shared [`crate::cm::Control`] for
+    /// pause/resume/cancel and a live byte counter.
+    pub fn pack_with_control(
+        files: &[(&str, &[u8])],
+        level: u8,
+        ctrl: &crate::cm::Control,
+    ) -> Result<Vec<u8>> {
+        let (table, combined) = Self::build_table(files);
+        let payload = crate::codec::compress_with_control(&combined, level, ctrl)?;
+        let mut out = Vec::with_capacity(table.len() + payload.len());
+        out.extend_from_slice(&table);
+        out.extend_from_slice(&payload);
+        Ok(out)
+    }
+
+    /// Build the file table and the concatenated data stream.
+    fn build_table(files: &[(&str, &[u8])]) -> (Vec<u8>, Vec<u8>) {
         let n = files.len() as u32;
         let mut table: Vec<u8> = Vec::new();
         table.extend_from_slice(MAGIC);
@@ -53,27 +77,28 @@ impl SolidArchive {
             table.extend_from_slice(name_bytes);
             table.extend_from_slice(&(data.len() as u64).to_le_bytes());
         }
-
-        // Concatenate all file data and compress as one stream
         let total: usize = files.iter().map(|(_, d)| d.len()).sum();
         let mut combined = Vec::with_capacity(total);
         for &(_, data) in files {
             combined.extend_from_slice(data);
         }
-        let payload = crate::codec::compress_with_progress(&combined, level, on_progress)?;
-
-        let mut out = Vec::with_capacity(table.len() + payload.len());
-        out.extend_from_slice(&table);
-        out.extend_from_slice(&payload);
-        Ok(out)
+        (table, combined)
     }
 
     /// Decompress a solid archive, returning (name, data) pairs.
     pub fn unpack(input: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+        Self::unpack_with_control(input, &crate::cm::Control::new())
+    }
+
+    /// Decompress a solid archive with a shared [`crate::cm::Control`].
+    pub fn unpack_with_control(
+        input: &[u8],
+        ctrl: &crate::cm::Control,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
         let (entries, payload_start) = Self::parse_table(input)?;
 
         let payload = &input[payload_start..];
-        let combined = crate::codec::decompress(payload)?;
+        let combined = crate::codec::decompress_with_control(payload, ctrl)?;
 
         let mut result = Vec::with_capacity(entries.len());
         let mut pos = 0usize;

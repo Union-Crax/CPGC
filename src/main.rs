@@ -46,12 +46,6 @@ enum Commands {
     Info {
         archive: PathBuf,
     },
-    /// Launch the native desktop GUI (7-Zip-style file manager)
-    Gui {
-        /// Directory to open in the file browser (default: current directory)
-        #[arg(short, long)]
-        dir: Option<PathBuf>,
-    },
 }
 
 fn main() -> Result<()> {
@@ -63,7 +57,6 @@ fn main() -> Result<()> {
         Commands::List { archive }                   => cmd_list(&archive),
         Commands::Bench { corpus_dir }               => cmd_bench(&corpus_dir),
         Commands::Info { archive }                   => cmd_info(&archive),
-        Commands::Gui { dir }                         => cmd_gui(dir),
     }
 }
 
@@ -222,17 +215,6 @@ fn cmd_verify(archive: &PathBuf) -> Result<()> {
         );
     }
     Ok(())
-}
-
-#[cfg(feature = "gui")]
-fn cmd_gui(dir: Option<PathBuf>) -> Result<()> {
-    let dir = dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    cpgc::gui::run(dir)
-}
-
-#[cfg(not(feature = "gui"))]
-fn cmd_gui(_dir: Option<PathBuf>) -> Result<()> {
-    bail!("this binary was built without the `gui` feature; rebuild with `cargo build --features gui`")
 }
 
 fn cmd_info(archive: &PathBuf) -> Result<()> {

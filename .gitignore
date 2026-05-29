@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target/
 
+# Installer / packaging output
+/dist/
+
 # Cargo lock is committed for binaries
 # Cargo.lock
 
