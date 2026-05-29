@@ -132,7 +132,7 @@ Input → Content Analyzer → Transform Preprocessor → CPGC-NX context mixer 
 ## Build
 
 ```sh
-cargo build --release          # includes the web GUI (default)
+cargo build --release          # includes the native GUI (default)
 cargo build --release --no-default-features   # lean CLI-only binary
 ```
 
@@ -140,20 +140,41 @@ Binary: `target/release/cpgc`
 
 ---
 
-## GUI (7-Zip-style, in your browser)
+## GUI (native 7-Zip-style app)
 
 ```sh
-cpgc gui                       # then open http://127.0.0.1:8087
-cpgc gui --port 9000 --root /data
+cpgc gui                       # opens a desktop window
+cpgc gui --dir /data           # start in a specific folder
 ```
 
-`cpgc gui` starts a small local web server and serves a file-manager UI: browse
-folders, tick files/folders to compress into a `.cpgc`/`.cpas` archive, inspect
-archives, and extract them — all with a couple of clicks. Because it is plain
-HTTP + HTML it works identically on a headless server (browse to it from
-another machine over an SSH tunnel) and on a desktop, with no GL/X11/display
-dependencies. All file access is sandboxed under `--root` (default: the current
-directory).
+`cpgc gui` opens a real native window (egui/eframe — no browser): browse
+folders, tick files or directories, choose a compression level, and click
+**Compress** to make a `.cpgc` single-file or `.cpas` solid archive. Each
+archive row has **Extract** and **Verify** buttons. Long operations run on a
+background thread with a live progress bar. It is cross-platform
+(Windows/macOS/Linux) and needs a graphical desktop to run; on a headless
+machine it exits with a clear "no display" message — use the CLI there.
+
+---
+
+## Compression levels
+
+`-l`/`--level` (1–9, default 5) trades speed for ratio by setting the parallel
+**segment size**: lower levels use smaller segments (more cores, faster, a
+little larger), higher levels use larger segments (better ratio, less
+parallelism). The size is recorded in the archive, so decompression never needs
+to know the level. Levels ≥ 5 also enable the transform pass. Example on 9 MB of
+text:
+
+| level | size | bits/byte | speed |
+|--:|--:|--:|--:|
+| 1 (fastest) | 889 KB | 0.77 | 1.08 MB/s |
+| 3 | 794 KB | 0.69 | 0.73 MB/s |
+| 5 (default) | 758 KB | 0.66 | 0.34 MB/s |
+| 9 (best ratio) | 758 KB | 0.66 | 0.34 MB/s |
+
+(Levels 5–9 coincide here because the file is smaller than one segment; they
+diverge on larger archives.)
 
 ---
 
@@ -168,8 +189,7 @@ cpgc compress <input> [output.cpgc] [-l <level>]
 ```
 
 The output path is optional — it defaults to `<input>.cpgc`. Pass a directory
-to build a solid multi-file archive. `-l`/`--level` is 1–9 (default 5); levels
-≥ 5 enable the content analyzer and transform pass.
+to build a solid multi-file archive. `-l`/`--level` is 1–9 (default 5).
 
 ```
 "file.txt" → "file.txt.cpgc"

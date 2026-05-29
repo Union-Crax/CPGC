@@ -27,7 +27,7 @@ use crate::cm;
 use crate::transform::search::{find_best_transform, CANDIDATES};
 
 const MAGIC: &[u8; 4] = b"CPGC";
-const VERSION: u8 = 3;
+const VERSION: u8 = 4;
 const TAG_NORMAL: u8 = 0x00;
 const TAG_PASSTHROUGH: u8 = 0xFF;
 
@@ -50,13 +50,14 @@ pub fn compress_with_progress(
     let n_blocks = if n == 0 { 0usize } else { (n + WINDOW_SIZE - 1) / WINDOW_SIZE };
 
     // ------------------------------------------------------------------
-    // Step 1: Classify blocks and pre-compute transforms (level ≥ 5 only)
+    // Step 1: Classify blocks; pass through incompressible blocks (every level)
+    // and search transforms on structured ones (level ≥ 5).
     // ------------------------------------------------------------------
     let mut block_tags: Vec<u8> = vec![TAG_NORMAL; n_blocks];
     // Transformed data for transform-tagged blocks; None = use original chunk.
     let mut block_transformed: Vec<Option<Vec<u8>>> = vec![None; n_blocks];
 
-    if level >= 5 && n > 0 {
+    if n > 0 {
         let regions = classify(input);
         for (block_idx, region) in regions.iter().enumerate() {
             if block_idx >= n_blocks { break; }
@@ -65,8 +66,10 @@ pub fn compress_with_progress(
             let chunk = &input[start..end];
 
             if region.passthrough {
+                // Passing incompressible data through guards against expansion
+                // at every level, not just ≥ 5.
                 block_tags[block_idx] = TAG_PASSTHROUGH;
-            } else if region.use_transform {
+            } else if level >= 5 && region.use_transform {
                 if let Some((op, transformed)) = find_best_transform(chunk) {
                     if let Some(tag) = op_to_tag(op) {
                         block_tags[block_idx] = tag;
@@ -108,7 +111,7 @@ pub fn compress_with_progress(
     if pt_done > 0 {
         on_progress(pt_done.min(grand_total), grand_total);
     }
-    let ans_payload = cm::encode(&to_encode);
+    let ans_payload = cm::encode(&to_encode, level);
     on_progress(grand_total, grand_total);
 
     // ------------------------------------------------------------------

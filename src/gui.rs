@@ -1,253 +1,435 @@
-//! Built-in local web GUI — a 7-Zip-style file manager served over HTTP.
+//! Native desktop GUI — a 7-Zip-style file manager built with egui/eframe.
 //!
-//! `cpgc gui` starts a small server bound to localhost and prints a URL. Open
-//! it in any browser to browse files, compress selections into `.cpgc`
-//! archives, inspect archives, and extract them — no GL/X11/display required,
-//! so it works the same on a headless server and a desktop.
-//!
-//! All file access happens server-side and is sandboxed under a `--root`
-//! directory (default: the working directory). The HTTP API is intentionally
-//! tiny: form-encoded requests, hand-built JSON responses, no async runtime.
+//! `cpgc gui` opens a real OS window (no browser): browse folders, tick files
+//! or directories, pick a compression level, and compress them into a `.cpgc`
+//! single-file archive or a `.cpas` solid multi-file archive. Select an archive
+//! to extract or verify it. Long operations run on a background thread with a
+//! live progress bar so the UI never freezes.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, Sender};
+use std::time::Instant;
 
-use anyhow::{anyhow, Context, Result};
-use tiny_http::{Header, Method, Response, Server};
+use anyhow::{anyhow, Result};
+use eframe::egui;
 
 use crate::archive::solid::SolidArchive;
 use crate::codec;
 
-/// Start the GUI server and serve requests until the process is killed.
-pub fn run(port: u16, root: PathBuf) -> Result<()> {
-    let root = root
+/// Launch the GUI. `start_dir` is the initial directory shown.
+pub fn run(start_dir: PathBuf) -> Result<()> {
+    let start_dir = start_dir
         .canonicalize()
-        .with_context(|| format!("resolving root {:?}", root))?;
-    let addr = format!("127.0.0.1:{port}");
-    let server = Server::http(&addr).map_err(|e| anyhow!("starting server: {e}"))?;
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    println!("┌──────────────────────────────────────────────┐");
-    println!("│  CPGC GUI is running                           │");
-    println!("│  → open  http://{addr}            ", );
-    println!("│  root: {}", root.display());
-    println!("│  press Ctrl-C to stop                          │");
-    println!("└──────────────────────────────────────────────┘");
-
-    for request in server.incoming_requests() {
-        if let Err(e) = handle(request, &root) {
-            eprintln!("request error: {e:#}");
-        }
-    }
-    Ok(())
-}
-
-fn handle(mut request: tiny_http::Request, root: &Path) -> Result<()> {
-    let url = request.url().to_string();
-    let method = request.method().clone();
-    let (path, query) = split_query(&url);
-
-    // Read the request body (small form-encoded payloads only).
-    let mut body = String::new();
-    if matches!(method, Method::Post) {
-        request.as_reader().read_to_string(&mut body).ok();
-    }
-
-    let result = match (&method, path) {
-        (Method::Get, "/") => respond_html(request, INDEX_HTML),
-        (Method::Get, "/api/ls") => {
-            let json = api_ls(root, &query);
-            respond_json(request, &json)
-        }
-        (Method::Get, "/api/info") => {
-            let json = api_info(root, &query);
-            respond_json(request, &json)
-        }
-        (Method::Post, "/api/compress") => {
-            let json = api_compress(root, &body);
-            respond_json(request, &json)
-        }
-        (Method::Post, "/api/extract") => {
-            let json = api_extract(root, &body);
-            respond_json(request, &json)
-        }
-        _ => request
-            .respond(Response::from_string("not found").with_status_code(404))
-            .map_err(|e| anyhow!("{e}")),
-    };
-    result
-}
-
-// ---------------------------------------------------------------------------
-// API handlers — each returns a JSON string.
-// ---------------------------------------------------------------------------
-
-fn api_ls(root: &Path, query: &str) -> String {
-    let p = query_param(query, "path").unwrap_or_default();
-    let dir = match resolve_existing(root, &p) {
-        Some(d) if d.is_dir() => d,
-        _ => root.to_path_buf(),
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([960.0, 620.0])
+            .with_min_inner_size([560.0, 360.0])
+            .with_title("CPGC — Compressor"),
+        ..Default::default()
     };
 
-    let mut entries: Vec<(String, bool, u64)> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            let (is_dir, size) = match e.metadata() {
-                Ok(m) => (m.is_dir(), m.len()),
-                Err(_) => (false, 0),
-            };
-            entries.push((name, is_dir, size));
-        }
-    }
-    // Directories first, then files, each alphabetical (case-insensitive).
-    entries.sort_by(|a, b| {
-        b.1.cmp(&a.1)
-            .then(a.0.to_lowercase().cmp(&b.0.to_lowercase()))
-    });
-
-    let parent = dir
-        .parent()
-        .filter(|pp| pp.starts_with(root) || *pp == root)
-        .map(|pp| pp.to_string_lossy().to_string())
-        .filter(|_| dir != root);
-
-    let mut items = String::new();
-    for (i, (name, is_dir, size)) in entries.iter().enumerate() {
-        if i > 0 {
-            items.push(',');
-        }
-        let lower = name.to_lowercase();
-        let is_archive = lower.ends_with(".cpgc") || lower.ends_with(".cpas");
-        items.push_str(&format!(
-            "{{\"name\":{},\"dir\":{},\"size\":{},\"archive\":{}}}",
-            json_str(name),
-            is_dir,
-            size,
-            is_archive
-        ));
-    }
-    format!(
-        "{{\"path\":{},\"parent\":{},\"entries\":[{}]}}",
-        json_str(&dir.to_string_lossy()),
-        match parent {
-            Some(p) => json_str(&p),
-            None => "null".to_string(),
-        },
-        items
+    eframe::run_native(
+        "CPGC",
+        options,
+        Box::new(move |_cc| Box::new(CpgcApp::new(start_dir))),
     )
+    .map_err(|e| anyhow!("GUI failed to start: {e}"))
 }
 
-fn api_info(root: &Path, query: &str) -> String {
-    let p = query_param(query, "path").unwrap_or_default();
-    let file = match resolve_existing(root, &p) {
-        Some(f) if f.is_file() => f,
-        _ => return err_json("not a file"),
-    };
-    let data = match std::fs::read(&file) {
-        Ok(d) => d,
-        Err(e) => return err_json(&format!("read failed: {e}")),
-    };
-    if data.starts_with(b"CPAS") {
-        match SolidArchive::list(&data) {
-            Ok(list) => {
-                let mut items = String::new();
-                for (i, (name, size)) in list.iter().enumerate() {
-                    if i > 0 {
-                        items.push(',');
-                    }
-                    items.push_str(&format!(
-                        "{{\"name\":{},\"size\":{}}}",
-                        json_str(name),
-                        size
-                    ));
-                }
-                format!(
-                    "{{\"ok\":true,\"kind\":\"solid\",\"compressed\":{},\"files\":[{}]}}",
-                    data.len(),
-                    items
-                )
-            }
-            Err(e) => err_json(&format!("{e}")),
-        }
-    } else if data.starts_with(b"CPGC") {
-        let orig = if data.len() >= 14 {
-            u64::from_le_bytes(data[6..14].try_into().unwrap())
-        } else {
-            0
+// ---------------------------------------------------------------------------
+// App state
+// ---------------------------------------------------------------------------
+
+struct Entry {
+    path: PathBuf,
+    name: String,
+    is_dir: bool,
+    is_archive: bool,
+    size: u64,
+}
+
+#[derive(PartialEq)]
+enum StatusKind {
+    Info,
+    Ok,
+    Err,
+}
+
+/// Messages from a background worker to the UI thread.
+enum JobMsg {
+    Progress(f32),
+    Done(std::result::Result<String, String>),
+}
+
+struct Job {
+    rx: Receiver<JobMsg>,
+    label: String,
+    progress: f32,
+    started: Instant,
+}
+
+struct CpgcApp {
+    cwd: PathBuf,
+    entries: Vec<Entry>,
+    selected: BTreeSet<PathBuf>,
+    level: u8,
+    out_name: String,
+    extract_dest: String,
+    status: String,
+    status_kind: StatusKind,
+    job: Option<Job>,
+}
+
+impl CpgcApp {
+    fn new(cwd: PathBuf) -> Self {
+        let mut app = Self {
+            cwd,
+            entries: Vec::new(),
+            selected: BTreeSet::new(),
+            level: 5,
+            out_name: "archive.cpgc".to_string(),
+            extract_dest: String::new(),
+            status: "Ready. Tick items to compress, or pick an archive to extract.".to_string(),
+            status_kind: StatusKind::Info,
+            job: None,
         };
-        format!(
-            "{{\"ok\":true,\"kind\":\"single\",\"compressed\":{},\"original\":{},\"ratio\":{:.4}}}",
-            data.len(),
-            orig,
-            data.len() as f64 / orig.max(1) as f64
-        )
-    } else {
-        err_json("not a CPGC archive")
+        app.refresh();
+        app
+    }
+
+    fn refresh(&mut self) {
+        self.entries.clear();
+        if let Ok(rd) = std::fs::read_dir(&self.cwd) {
+            for e in rd.flatten() {
+                let path = e.path();
+                let name = e.file_name().to_string_lossy().to_string();
+                let (is_dir, size) = match e.metadata() {
+                    Ok(m) => (m.is_dir(), m.len()),
+                    Err(_) => (false, 0),
+                };
+                let lower = name.to_lowercase();
+                let is_archive = lower.ends_with(".cpgc") || lower.ends_with(".cpas");
+                self.entries.push(Entry { path, name, is_dir, is_archive, size });
+            }
+        }
+        self.entries.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        // Drop selections that are no longer present.
+        let present: BTreeSet<PathBuf> = self.entries.iter().map(|e| e.path.clone()).collect();
+        self.selected.retain(|p| present.contains(p));
+    }
+
+    fn navigate(&mut self, dir: PathBuf) {
+        if let Ok(c) = dir.canonicalize() {
+            self.cwd = c;
+            self.selected.clear();
+            self.refresh();
+        }
+    }
+
+    fn set_status(&mut self, kind: StatusKind, msg: impl Into<String>) {
+        self.status_kind = kind;
+        self.status = msg.into();
+    }
+
+    fn busy(&self) -> bool {
+        self.job.is_some()
+    }
+
+    // --- background jobs ------------------------------------------------
+
+    fn poll_job(&mut self) {
+        let mut finished: Option<std::result::Result<String, String>> = None;
+        if let Some(job) = &mut self.job {
+            while let Ok(msg) = job.rx.try_recv() {
+                match msg {
+                    JobMsg::Progress(p) => job.progress = p,
+                    JobMsg::Done(res) => finished = Some(res),
+                }
+            }
+        }
+        if let Some(res) = finished {
+            match res {
+                Ok(m) => self.set_status(StatusKind::Ok, m),
+                Err(e) => self.set_status(StatusKind::Err, e),
+            }
+            self.job = None;
+            self.refresh();
+        }
+    }
+
+    fn start_compress(&mut self) {
+        if self.busy() || self.selected.is_empty() {
+            return;
+        }
+        let mut out = self.out_name.trim().to_string();
+        if out.is_empty() {
+            out = "archive.cpgc".to_string();
+        }
+        if !out.to_lowercase().ends_with(".cpgc") && !out.to_lowercase().ends_with(".cpas") {
+            out.push_str(".cpgc");
+        }
+        let output = self.cwd.join(&out);
+        let inputs: Vec<PathBuf> = self.selected.iter().cloned().collect();
+        let level = self.level;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let label = format!("Compressing {} item(s) → {}", inputs.len(), out);
+        self.set_status(StatusKind::Info, label.clone());
+        spawn_compress(inputs, output, level, tx);
+        self.job = Some(Job { rx, label, progress: 0.0, started: Instant::now() });
+    }
+
+    fn start_extract(&mut self, archive: PathBuf) {
+        if self.busy() {
+            return;
+        }
+        let base = archive
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "extracted".to_string());
+        let dest = if self.extract_dest.trim().is_empty() {
+            self.cwd.join(format!("{base}_extracted"))
+        } else {
+            self.cwd.join(self.extract_dest.trim())
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let label = format!("Extracting {}", file_name(&archive));
+        self.set_status(StatusKind::Info, label.clone());
+        spawn_extract(archive, dest, tx);
+        self.job = Some(Job { rx, label, progress: 0.0, started: Instant::now() });
+    }
+
+    fn start_verify(&mut self, archive: PathBuf) {
+        if self.busy() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let label = format!("Verifying {}", file_name(&archive));
+        self.set_status(StatusKind::Info, label.clone());
+        spawn_verify(archive, tx);
+        self.job = Some(Job { rx, label, progress: 0.0, started: Instant::now() });
     }
 }
 
-fn api_compress(root: &Path, body: &str) -> String {
-    let inputs: Vec<String> = query_param(body, "inputs")
-        .unwrap_or_default()
-        .split('\n')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let output = query_param(body, "output").unwrap_or_default();
-    let level: u8 = query_param(body, "level")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
+// ---------------------------------------------------------------------------
+// UI
+// ---------------------------------------------------------------------------
 
-    if inputs.is_empty() || output.is_empty() {
-        return err_json("select at least one item and an output name");
-    }
-    let out_path = match resolve_new(root, &output) {
-        Some(p) => p,
-        None => return err_json("output path is outside the allowed root"),
-    };
+impl eframe::App for CpgcApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_job();
+        if self.busy() {
+            ctx.request_repaint(); // keep the progress bar animating
+        }
 
-    match do_compress(root, &inputs, &out_path, level) {
-        Ok((orig, comp, nfiles)) => format!(
-            "{{\"ok\":true,\"output\":{},\"original\":{},\"compressed\":{},\"ratio\":{:.4},\"files\":{}}}",
-            json_str(&out_path.to_string_lossy()),
-            orig,
-            comp,
-            comp as f64 / orig.max(1) as f64,
-            nfiles
-        ),
-        Err(e) => err_json(&format!("{e:#}")),
+        self.top_bar(ctx);
+        self.bottom_bar(ctx);
+        self.file_list(ctx);
     }
+}
+
+impl CpgcApp {
+    fn top_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.heading("📦 CPGC");
+                ui.separator();
+
+                let busy = self.busy();
+                ui.add_enabled_ui(!busy, |ui| {
+                    if ui.button("⬆ Up").clicked() {
+                        if let Some(parent) = self.cwd.parent() {
+                            self.navigate(parent.to_path_buf());
+                        }
+                    }
+                });
+
+                ui.label(format!("{} selected", self.selected.len()));
+                ui.separator();
+
+                ui.label("Level");
+                egui::ComboBox::from_id_source("level")
+                    .selected_text(level_label(self.level))
+                    .show_ui(ui, |ui| {
+                        for lvl in 1u8..=9 {
+                            ui.selectable_value(&mut self.level, lvl, level_label(lvl));
+                        }
+                    });
+
+                ui.separator();
+                ui.label("Output");
+                ui.add(egui::TextEdit::singleline(&mut self.out_name).desired_width(160.0));
+
+                ui.add_enabled_ui(!busy && !self.selected.is_empty(), |ui| {
+                    if ui.button("🗜 Compress").clicked() {
+                        self.start_compress();
+                    }
+                });
+            });
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.label("📂");
+                ui.monospace(self.cwd.to_string_lossy());
+            });
+            ui.add_space(4.0);
+        });
+    }
+
+    fn bottom_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            ui.add_space(4.0);
+            if let Some(job) = &self.job {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(&job.label);
+                });
+                let p = if job.progress > 0.0 { job.progress } else { 0.02 };
+                ui.add(egui::ProgressBar::new(p).show_percentage().animate(true));
+            } else {
+                let color = match self.status_kind {
+                    StatusKind::Ok => egui::Color32::from_rgb(0x3f, 0xbf, 0x6f),
+                    StatusKind::Err => egui::Color32::from_rgb(0xff, 0x6b, 0x6b),
+                    StatusKind::Info => ui.visuals().text_color(),
+                };
+                ui.colored_label(color, &self.status);
+            }
+            ui.add_space(4.0);
+        });
+    }
+
+    fn file_list(&mut self, ctx: &egui::Context) {
+        // Actions deferred until after the immutable iteration over entries.
+        let mut nav_to: Option<PathBuf> = None;
+        let mut toggle: Option<PathBuf> = None;
+        let mut extract: Option<PathBuf> = None;
+        let mut verify: Option<PathBuf> = None;
+        let busy = self.busy();
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                egui::Grid::new("files")
+                    .num_columns(4)
+                    .striped(true)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.strong("");
+                        ui.strong("Name");
+                        ui.strong("Size");
+                        ui.strong("Action");
+                        ui.end_row();
+
+                        for e in &self.entries {
+                            // Selection checkbox (files and folders both selectable).
+                            let mut sel = self.selected.contains(&e.path);
+                            if ui.add_enabled(!busy, egui::Checkbox::without_text(&mut sel)).changed() {
+                                toggle = Some(e.path.clone());
+                            }
+
+                            // Name — folders navigate, files toggle selection.
+                            let icon = if e.is_dir {
+                                "📁"
+                            } else if e.is_archive {
+                                "🗜"
+                            } else {
+                                "📄"
+                            };
+                            let label = format!("{icon} {}", e.name);
+                            if e.is_dir {
+                                if ui.add_enabled(!busy, egui::Button::new(label).frame(false)).clicked() {
+                                    nav_to = Some(e.path.clone());
+                                }
+                            } else if ui.add(egui::SelectableLabel::new(sel, label)).clicked() {
+                                toggle = Some(e.path.clone());
+                            }
+
+                            // Size.
+                            if e.is_dir {
+                                ui.label("—");
+                            } else {
+                                ui.monospace(human_size(e.size));
+                            }
+
+                            // Per-row actions for archives.
+                            ui.horizontal(|ui| {
+                                if e.is_archive {
+                                    ui.add_enabled_ui(!busy, |ui| {
+                                        if ui.button("Extract").clicked() {
+                                            extract = Some(e.path.clone());
+                                        }
+                                        if ui.button("Verify").clicked() {
+                                            verify = Some(e.path.clone());
+                                        }
+                                    });
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
+            });
+        });
+
+        if let Some(p) = toggle {
+            if !self.selected.remove(&p) {
+                self.selected.insert(p);
+            }
+        }
+        if let Some(p) = nav_to {
+            self.navigate(p);
+        }
+        if let Some(p) = extract {
+            self.start_extract(p);
+        }
+        if let Some(p) = verify {
+            self.start_verify(p);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background workers
+// ---------------------------------------------------------------------------
+
+fn spawn_compress(inputs: Vec<PathBuf>, output: PathBuf, level: u8, tx: Sender<JobMsg>) {
+    std::thread::spawn(move || {
+        let res = do_compress(&inputs, &output, level, &tx).map_err(|e| format!("{e:#}"));
+        let _ = tx.send(JobMsg::Done(res));
+    });
 }
 
 fn do_compress(
-    root: &Path,
-    inputs: &[String],
-    out_path: &Path,
+    inputs: &[PathBuf],
+    output: &Path,
     level: u8,
-) -> Result<(usize, usize, usize)> {
-    // Resolve and gather (relative_name, bytes) for every input file.
+    tx: &Sender<JobMsg>,
+) -> Result<String> {
+    // Gather (relative_name, bytes) for every input file.
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     for inp in inputs {
-        let p = resolve_existing(root, inp).ok_or_else(|| anyhow!("not found: {inp}"))?;
-        if p.is_dir() {
-            for entry in walkdir::WalkDir::new(&p).sort_by_file_name() {
+        if inp.is_dir() {
+            let base = inp.parent().unwrap_or(inp);
+            for entry in walkdir::WalkDir::new(inp).sort_by_file_name() {
                 let entry = entry?;
                 if !entry.file_type().is_file() {
                     continue;
                 }
                 let rel = entry
                     .path()
-                    .strip_prefix(p.parent().unwrap_or(&p))
+                    .strip_prefix(base)
                     .unwrap_or(entry.path())
                     .to_string_lossy()
                     .replace('\\', "/");
                 files.push((rel, std::fs::read(entry.path())?));
             }
         } else {
-            let name = p
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "file".to_string());
-            files.push((name, std::fs::read(&p)?));
+            files.push((file_name(inp), std::fs::read(inp)?));
         }
     }
     if files.is_empty() {
@@ -255,46 +437,39 @@ fn do_compress(
     }
     let total_raw: usize = files.iter().map(|(_, d)| d.len()).sum();
 
-    // One plain file → single-file .cpgc. Otherwise a solid CPAS archive.
+    let progress = |done: usize, total: usize| {
+        let _ = tx.send(JobMsg::Progress(done as f32 / total.max(1) as f32));
+    };
+
     let packed = if files.len() == 1 {
-        codec::compress(&files[0].1, level)?
+        codec::compress_with_progress(&files[0].1, level, progress)?
     } else {
         let pairs: Vec<(&str, &[u8])> =
             files.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
-        SolidArchive::pack(&pairs, level)?
+        SolidArchive::pack_with_progress(&pairs, level, progress)?
     };
-    std::fs::write(out_path, &packed)
-        .with_context(|| format!("writing {:?}", out_path))?;
-    Ok((total_raw, packed.len(), files.len()))
+    std::fs::write(output, &packed)?;
+
+    let pct = packed.len() as f64 / total_raw.max(1) as f64 * 100.0;
+    Ok(format!(
+        "✔ {} — {} → {} ({:.1}% of original, {} file(s))",
+        file_name(output),
+        human_size(total_raw as u64),
+        human_size(packed.len() as u64),
+        pct,
+        files.len()
+    ))
 }
 
-fn api_extract(root: &Path, body: &str) -> String {
-    let archive = query_param(body, "archive").unwrap_or_default();
-    let dest = query_param(body, "dest").unwrap_or_default();
-    if archive.is_empty() || dest.is_empty() {
-        return err_json("archive and destination are required");
-    }
-    let arc_path = match resolve_existing(root, &archive) {
-        Some(p) if p.is_file() => p,
-        _ => return err_json("archive not found"),
-    };
-    let dest_path = match resolve_new(root, &dest) {
-        Some(p) => p,
-        None => return err_json("destination is outside the allowed root"),
-    };
-
-    match do_extract(&arc_path, &dest_path) {
-        Ok(n) => format!(
-            "{{\"ok\":true,\"dest\":{},\"files\":{}}}",
-            json_str(&dest_path.to_string_lossy()),
-            n
-        ),
-        Err(e) => err_json(&format!("{e:#}")),
-    }
+fn spawn_extract(archive: PathBuf, dest: PathBuf, tx: Sender<JobMsg>) {
+    std::thread::spawn(move || {
+        let res = do_extract(&archive, &dest).map_err(|e| format!("{e:#}"));
+        let _ = tx.send(JobMsg::Done(res));
+    });
 }
 
-fn do_extract(arc_path: &Path, dest: &Path) -> Result<usize> {
-    let data = std::fs::read(arc_path)?;
+fn do_extract(archive: &Path, dest: &Path) -> Result<String> {
+    let data = std::fs::read(archive)?;
     std::fs::create_dir_all(dest)?;
     if data.starts_with(b"CPAS") {
         let files = SolidArchive::unpack(&data)?;
@@ -306,58 +481,84 @@ fn do_extract(arc_path: &Path, dest: &Path) -> Result<usize> {
             }
             std::fs::write(&out, bytes)?;
         }
-        Ok(files.len())
+        Ok(format!(
+            "✔ extracted {} file(s) → {}",
+            files.len(),
+            file_name(dest)
+        ))
     } else {
         let recovered = codec::decompress(&data)?;
-        // Strip a trailing .cpgc to name the recovered file.
-        let stem = arc_path
+        let stem = archive
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "recovered".to_string());
-        std::fs::write(dest.join(stem), recovered)?;
-        Ok(1)
+        std::fs::write(dest.join(&stem), recovered)?;
+        Ok(format!("✔ extracted 1 file → {}", file_name(dest)))
+    }
+}
+
+fn spawn_verify(archive: PathBuf, tx: Sender<JobMsg>) {
+    std::thread::spawn(move || {
+        let res = do_verify(&archive).map_err(|e| format!("{e:#}"));
+        let _ = tx.send(JobMsg::Done(res));
+    });
+}
+
+fn do_verify(archive: &Path) -> Result<String> {
+    let data = std::fs::read(archive)?;
+    if data.starts_with(b"CPAS") {
+        let files = SolidArchive::unpack(&data)?;
+        let total: usize = files.iter().map(|(_, d)| d.len()).sum();
+        Ok(format!(
+            "✔ verified: {} file(s), {} recovered",
+            files.len(),
+            human_size(total as u64)
+        ))
+    } else {
+        let recovered = codec::decompress(&data)?;
+        Ok(format!("✔ verified: {} recovered", human_size(recovered.len() as u64)))
     }
 }
 
 // ---------------------------------------------------------------------------
-// Path safety
+// Helpers
 // ---------------------------------------------------------------------------
 
-/// Resolve an existing path and ensure it stays under `root`.
-fn resolve_existing(root: &Path, p: &str) -> Option<PathBuf> {
-    let cand = PathBuf::from(p);
-    let abs = if cand.is_absolute() { cand } else { root.join(cand) };
-    let canon = abs.canonicalize().ok()?;
-    if canon.starts_with(root) {
-        Some(canon)
-    } else {
-        None
+fn level_label(level: u8) -> String {
+    match level {
+        1 => "1 — fastest".to_string(),
+        5 => "5 — default".to_string(),
+        9 => "9 — best ratio".to_string(),
+        l => l.to_string(),
     }
 }
 
-/// Resolve a (possibly not-yet-existing) output path: its parent must exist and
-/// stay under `root`.
-fn resolve_new(root: &Path, p: &str) -> Option<PathBuf> {
-    let cand = PathBuf::from(p);
-    let abs = if cand.is_absolute() { cand } else { root.join(cand) };
-    let parent = abs.parent()?;
-    let file = abs.file_name()?;
-    let canon_parent = parent.canonicalize().ok()?;
-    if canon_parent.starts_with(root) {
-        Some(canon_parent.join(file))
+fn file_name(p: &Path) -> String {
+    p.file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| p.to_string_lossy().to_string())
+}
+
+fn human_size(n: u64) -> String {
+    const KB: f64 = 1024.0;
+    let f = n as f64;
+    if f >= KB * KB * KB {
+        format!("{:.2} GB", f / (KB * KB * KB))
+    } else if f >= KB * KB {
+        format!("{:.2} MB", f / (KB * KB))
+    } else if f >= KB {
+        format!("{:.1} KB", f / KB)
     } else {
-        None
+        format!("{n} B")
     }
 }
 
-/// Drop leading separators, `.` and `..` components from an archive member name.
+/// Drop leading separators, `.` and `..` from an archive member name.
 fn sanitize_rel(name: &str) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in Path::new(name).components() {
-        use std::path::Component::*;
-        match comp {
-            Normal(c) => out.push(c),
-            _ => {} // ignore RootDir / ParentDir / CurDir / Prefix
+        if let std::path::Component::Normal(c) = comp {
+            out.push(c);
         }
     }
     if out.as_os_str().is_empty() {
@@ -365,108 +566,3 @@ fn sanitize_rel(name: &str) -> PathBuf {
     }
     out
 }
-
-// ---------------------------------------------------------------------------
-// HTTP / encoding helpers
-// ---------------------------------------------------------------------------
-
-fn split_query(url: &str) -> (&str, &str) {
-    match url.split_once('?') {
-        Some((p, q)) => (p, q),
-        None => (url, ""),
-    }
-}
-
-/// Extract and URL-decode a single field from a `&`-separated key=value string.
-fn query_param(query: &str, key: &str) -> Option<String> {
-    for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if k == key {
-                return Some(url_decode(v));
-            }
-        }
-    }
-    None
-}
-
-fn url_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' if i + 2 < bytes.len() => {
-                let hi = hex_val(bytes[i + 1]);
-                let lo = hex_val(bytes[i + 2]);
-                match (hi, lo) {
-                    (Some(h), Some(l)) => {
-                        out.push((h << 4) | l);
-                        i += 3;
-                    }
-                    _ => {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
-                }
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).to_string()
-}
-
-fn hex_val(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// Encode a string as a JSON string literal (with surrounding quotes).
-fn json_str(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-fn err_json(msg: &str) -> String {
-    format!("{{\"ok\":false,\"error\":{}}}", json_str(msg))
-}
-
-fn respond_json(request: tiny_http::Request, json: &str) -> Result<()> {
-    let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
-    request
-        .respond(Response::from_string(json).with_header(header))
-        .map_err(|e| anyhow!("{e}"))
-}
-
-fn respond_html(request: tiny_http::Request, html: &str) -> Result<()> {
-    let header =
-        Header::from_bytes(&b"Content-Type"[..], &b"text/html; charset=utf-8"[..]).unwrap();
-    request
-        .respond(Response::from_string(html).with_header(header))
-        .map_err(|e| anyhow!("{e}"))
-}
-
-const INDEX_HTML: &str = include_str!("gui/index.html");

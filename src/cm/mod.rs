@@ -39,38 +39,63 @@ use coder::{Decoder, Encoder};
 use predictor::Predictor;
 use rayon::prelude::*;
 
-/// Bytes per independent segment. Inputs larger than this are split so the
-/// segments can be (de)compressed on separate cores. Chosen large enough that
-/// per-segment model warm-up is a negligible fraction of the segment.
-pub const SEG_SIZE: usize = 16 << 20; // 16 MiB
+/// Default segment size (compression level 5). Inputs larger than the level's
+/// segment size are split so the segments can be (de)compressed on separate
+/// cores. Larger segments give a better ratio (more match history per segment)
+/// at the cost of less parallelism — that trade-off is the compression level.
+pub const SEG_SIZE: usize = 16 << 20; // 16 MiB == level 5
 
-/// Compress `data` into a self-contained CPGC-NX payload.
+/// Map a 1–9 compression level to a segment size.
 ///
-/// The payload is self-framing for segmentation but carries no *total* length
-/// prefix — the caller is expected to know how many bytes to decode (CPGC
-/// stores `orig_len` in its container header).
+/// Lower levels use smaller segments: more parallelism (faster) at a small
+/// ratio cost. Higher levels use larger segments: better ratio, less
+/// parallelism. The chosen size is stored in the payload, so decoding never
+/// depends on this mapping.
+pub fn seg_size_for_level(level: u8) -> usize {
+    let bits: u32 = match level {
+        0 | 1 => 20, // 1 MiB
+        2 => 21,
+        3 => 22,
+        4 => 23,
+        5 => 24, // 16 MiB (default)
+        6 => 25,
+        7 => 26,
+        8 => 27,
+        _ => 28, // 256 MiB
+    };
+    1usize << bits
+}
+
+/// Compress `data` into a self-contained CPGC-NX payload at the given level.
+///
+/// The payload is self-framing — it records the segment size and each
+/// segment's compressed length — but carries no *total* length prefix; the
+/// caller is expected to know how many bytes to decode (CPGC stores `orig_len`
+/// in its container header).
 ///
 /// Layout:
 /// ```text
-/// [0..4]   n_seg: u32 LE
-/// [4..]    n_seg × (comp_len: u32 LE)
+/// [0..4]   seg_size: u32 LE   (bytes of original data per segment)
+/// [4..8]   n_seg: u32 LE
+/// [8..]    n_seg × (comp_len: u32 LE)
 /// [rest]   segment payloads, concatenated in order
 /// ```
-/// Segment `i` decompresses to `data[i*SEG_SIZE .. min((i+1)*SEG_SIZE, n)]`, so
+/// Segment `i` decompresses to `data[i*seg_size .. min((i+1)*seg_size, n)]`, so
 /// only the *compressed* lengths need to be stored.
-pub fn encode(data: &[u8]) -> Vec<u8> {
-    encode_framed(data, SEG_SIZE)
+pub fn encode(data: &[u8], level: u8) -> Vec<u8> {
+    encode_framed(data, seg_size_for_level(level))
 }
 
 /// Decode exactly `n` bytes from a payload produced by [`encode`].
 pub fn decode(payload: &[u8], n: usize) -> Vec<u8> {
-    decode_framed(payload, n, SEG_SIZE)
+    decode_framed(payload, n)
 }
 
 fn encode_framed(data: &[u8], seg_size: usize) -> Vec<u8> {
     if data.is_empty() {
         return Vec::new();
     }
+    let seg_size = seg_size.max(1);
 
     // Compress each segment independently, in parallel.
     let segments: Vec<Vec<u8>> = data
@@ -79,9 +104,10 @@ fn encode_framed(data: &[u8], seg_size: usize) -> Vec<u8> {
         .collect();
 
     let n_seg = segments.len();
-    let header = 4 + 4 * n_seg;
+    let header = 8 + 4 * n_seg;
     let body: usize = segments.iter().map(|s| s.len()).sum();
     let mut out = Vec::with_capacity(header + body);
+    out.extend_from_slice(&(seg_size as u32).to_le_bytes());
     out.extend_from_slice(&(n_seg as u32).to_le_bytes());
     for s in &segments {
         out.extend_from_slice(&(s.len() as u32).to_le_bytes());
@@ -92,20 +118,21 @@ fn encode_framed(data: &[u8], seg_size: usize) -> Vec<u8> {
     out
 }
 
-fn decode_framed(payload: &[u8], n: usize, seg_size: usize) -> Vec<u8> {
-    if n == 0 || payload.len() < 4 {
+fn decode_framed(payload: &[u8], n: usize) -> Vec<u8> {
+    if n == 0 || payload.len() < 8 {
         return Vec::new();
     }
-    let n_seg = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+    let seg_size = (u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize).max(1);
+    let n_seg = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
     let comp_lens: Vec<usize> = (0..n_seg)
         .map(|i| {
-            let o = 4 + 4 * i;
+            let o = 8 + 4 * i;
             u32::from_le_bytes(payload[o..o + 4].try_into().unwrap()) as usize
         })
         .collect();
 
     // Slice the concatenated payloads and pair each with its decoded length.
-    let mut body = &payload[4 + 4 * n_seg..];
+    let mut body = &payload[8 + 4 * n_seg..];
     let mut jobs: Vec<(&[u8], usize)> = Vec::with_capacity(n_seg);
     for (i, &clen) in comp_lens.iter().enumerate() {
         let seg_start = i * seg_size;
@@ -169,16 +196,17 @@ mod tests {
     use super::*;
 
     fn roundtrip(data: &[u8]) {
-        let payload = encode(data);
+        let payload = encode(data, 5);
         let decoded = decode(&payload, data.len());
         assert_eq!(decoded, data, "roundtrip mismatch ({} bytes)", data.len());
     }
 
     /// Round-trip with an explicit (small) segment size to exercise the
-    /// multi-segment parallel framing without needing multi-MiB inputs.
+    /// multi-segment parallel framing without needing multi-MiB inputs. The
+    /// segment size is recovered from the payload, so decode needs no hint.
     fn roundtrip_segmented(data: &[u8], seg: usize) {
         let payload = encode_framed(data, seg);
-        let decoded = decode_framed(&payload, data.len(), seg);
+        let decoded = decode_framed(&payload, data.len());
         assert_eq!(
             decoded, data,
             "segmented roundtrip mismatch (seg={seg}, {} bytes)",
@@ -218,8 +246,8 @@ mod tests {
         let s = "compression test data ".repeat(2000);
         let one = encode_framed(s.as_bytes(), s.len() + 1);
         let many = encode_framed(s.as_bytes(), 4096);
-        assert_eq!(decode_framed(&one, s.len(), s.len() + 1), s.as_bytes());
-        assert_eq!(decode_framed(&many, s.len(), 4096), s.as_bytes());
+        assert_eq!(decode_framed(&one, s.len()), s.as_bytes());
+        assert_eq!(decode_framed(&many, s.len()), s.as_bytes());
     }
 
     #[test]
@@ -275,7 +303,7 @@ mod tests {
     #[test]
     fn compresses_repetitive() {
         let d = vec![b'a'; 10_000];
-        let payload = encode(&d);
+        let payload = encode(&d, 5);
         assert!(
             payload.len() < 200,
             "highly repetitive data should compress hard, got {} bytes",
@@ -286,7 +314,7 @@ mod tests {
     #[test]
     fn compresses_text_well() {
         let s = "the quick brown fox jumps over the lazy dog. ".repeat(1000);
-        let payload = encode(s.as_bytes());
+        let payload = encode(s.as_bytes(), 5);
         let bpb = payload.len() as f64 * 8.0 / s.len() as f64;
         assert!(bpb < 1.0, "structured text should be < 1 bpb, got {bpb:.3}");
     }
