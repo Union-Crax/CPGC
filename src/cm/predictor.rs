@@ -374,14 +374,26 @@ impl Predictor {
         self.buf.push(byte);
         let pos = self.buf.len();
 
-        // Refresh / seed a match from the suffix hash.
+        // Refresh / seed a match from the suffix hash. On a fresh seed we
+        // *verify* the candidate by extending backward, both to reject hash
+        // collisions and to recover the true match length — long verified
+        // matches let the mixer predict the continuation near-certainly, which
+        // is what captures long-range / cross-copy redundancy in big archives.
         if pos >= MATCH_MIN {
             let h = (self.suffix_hash() & self.match_mask) as usize;
             let cand = self.match_table[h];
             self.match_table[h] = pos as u32;
             if self.match_len == 0 && cand != MATCH_EMPTY && (cand as usize) < pos {
-                self.match_ptr = cand as usize;
-                self.match_len = MATCH_MIN as u32;
+                let c = cand as usize;
+                let max = c.min(pos);
+                let mut l = 0usize;
+                while l < max && self.buf[c - 1 - l] == self.buf[pos - 1 - l] && l < 0xffff {
+                    l += 1;
+                }
+                if l >= MATCH_MIN {
+                    self.match_ptr = c;
+                    self.match_len = l as u32;
+                }
             }
         }
         self.match_byte = if self.match_len > 0 && self.match_ptr < self.buf.len() {
