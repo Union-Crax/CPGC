@@ -5,13 +5,13 @@ edition = "2021"
 build = "build.rs"
 
 [features]
-default = ["gui"]
+default = []
 # Bundle pre-trained weights into the binary.
 # Place weights at src/predictor/pretrained.bin then:
 #   cargo build --release --features pretrained
 pretrained = []
-# Native desktop GUI (`cpgc gui`). Enabled by default; build the lean
-# CLI-only binary with `cargo build --release --no-default-features`.
+# Native desktop GUI (cpgc-gui binary).
+# Build with: cargo build --release --features gui --bin cpgc-gui
 gui = ["dep:eframe"]
 
 [dependencies]
@@ -43,6 +43,15 @@ tempfile = "3.8"
 opt-level = 3
 lto = true
 codegen-units = 1
+
+[[bin]]
+name = "cpgc"
+path = "src/main.rs"
+
+[[bin]]
+name = "cpgc-gui"
+path = "src/bin/cpgc-gui.rs"
+required-features = ["gui"]
 
 [[bench]]
 name = "corpus"

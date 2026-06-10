@@ -48,6 +48,62 @@ mod predictor;
 use coder::{Decoder, Encoder};
 use predictor::Predictor;
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+// Control state values
+const RUN: u8 = 0;
+const PAUSE: u8 = 1;
+const CANCEL: u8 = 2;
+
+/// Shared cooperative control + progress handle for a (de)compression job.
+///
+/// The rayon worker threads check it periodically: they block while paused,
+/// bail out when cancelled, and publish a running count of bytes processed so
+/// a UI can show a progress bar and live throughput. Cheap to share across
+/// threads (`Arc<Control>` or a plain borrow).
+#[derive(Default)]
+pub struct Control {
+    state: AtomicU8,
+    done:  AtomicU64,
+}
+
+impl Control {
+    pub fn new() -> Self {
+        Self { state: AtomicU8::new(RUN), done: AtomicU64::new(0) }
+    }
+    pub fn pause(&self) {
+        let _ = self.state.compare_exchange(RUN, PAUSE, Ordering::SeqCst, Ordering::SeqCst);
+    }
+    pub fn resume(&self) {
+        let _ = self.state.compare_exchange(PAUSE, RUN, Ordering::SeqCst, Ordering::SeqCst);
+    }
+    pub fn cancel(&self) {
+        self.state.store(CANCEL, Ordering::SeqCst);
+    }
+    pub fn is_paused(&self) -> bool {
+        self.state.load(Ordering::Relaxed) == PAUSE
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.state.load(Ordering::Relaxed) == CANCEL
+    }
+    /// Bytes processed so far (for progress bar / throughput display).
+    pub fn bytes_done(&self) -> u64 {
+        self.done.load(Ordering::Relaxed)
+    }
+    fn add_done(&self, n: u64) {
+        self.done.fetch_add(n, Ordering::Relaxed);
+    }
+    /// Block while paused; return `false` once cancelled.
+    fn proceed(&self) -> bool {
+        loop {
+            match self.state.load(Ordering::Relaxed) {
+                CANCEL => return false,
+                PAUSE  => std::thread::sleep(std::time::Duration::from_millis(15)),
+                _      => return true,
+            }
+        }
+    }
+}
 
 /// Default segment size (compression level 5). Inputs larger than the level's
 /// segment size are split so the segments can be (de)compressed on separate
@@ -96,25 +152,44 @@ pub fn seg_size_for_level(level: u8) -> usize {
 /// profile (a reduced model roster, several times faster); the profile byte
 /// means decoding never depends on the level mapping.
 pub fn encode(data: &[u8], level: u8) -> Vec<u8> {
-    encode_framed(data, seg_size_for_level(level), level <= 3)
+    encode_framed(data, seg_size_for_level(level), level <= 3, &Control::new())
+        .expect("uncontrolled encode is never cancelled")
+}
+
+/// Compress with a shared [`Control`] for pause/resume/cancel and a live byte
+/// counter. Returns `None` if the job was cancelled before completing.
+pub fn encode_with_control(data: &[u8], level: u8, ctrl: &Control) -> Option<Vec<u8>> {
+    encode_framed(data, seg_size_for_level(level), level <= 3, ctrl)
 }
 
 /// Decode exactly `n` bytes from a payload produced by [`encode`].
 pub fn decode(payload: &[u8], n: usize) -> Vec<u8> {
-    decode_framed(payload, n)
+    decode_framed(payload, n, &Control::new())
+        .expect("uncontrolled decode is never cancelled")
 }
 
-fn encode_framed(data: &[u8], seg_size: usize, turbo: bool) -> Vec<u8> {
+/// Decode with a shared [`Control`]. Returns `None` if cancelled.
+pub fn decode_with_control(payload: &[u8], n: usize, ctrl: &Control) -> Option<Vec<u8>> {
+    decode_framed(payload, n, ctrl)
+}
+
+// How often (in bytes) a worker checks the control flag and publishes progress.
+// Batching keeps the shared atomic cheap on the hot encode/decode loop.
+const CHECK_INTERVAL: usize = 1 << 12; // 4 KiB
+
+fn encode_framed(data: &[u8], seg_size: usize, turbo: bool, ctrl: &Control) -> Option<Vec<u8>> {
     if data.is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
     let seg_size = seg_size.max(1);
 
-    // Compress each segment independently, in parallel.
-    let segments: Vec<Vec<u8>> = data
+    // Compress each segment independently, in parallel. A cancelled segment
+    // yields `None`, which collapses the whole result to `None`.
+    let segments: Option<Vec<Vec<u8>>> = data
         .par_chunks(seg_size)
-        .map(|chunk| encode_segment(chunk, turbo))
+        .map(|chunk| encode_segment(chunk, turbo, ctrl))
         .collect();
+    let segments = segments?;
 
     let n_seg = segments.len();
     let header = 9 + 4 * n_seg;
@@ -129,12 +204,12 @@ fn encode_framed(data: &[u8], seg_size: usize, turbo: bool) -> Vec<u8> {
     for s in &segments {
         out.extend_from_slice(s);
     }
-    out
+    Some(out)
 }
 
-fn decode_framed(payload: &[u8], n: usize) -> Vec<u8> {
+fn decode_framed(payload: &[u8], n: usize, ctrl: &Control) -> Option<Vec<u8>> {
     if n == 0 || payload.len() < 9 {
-        return Vec::new();
+        return Some(Vec::new());
     }
     let seg_size = (u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize).max(1);
     let n_seg = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
@@ -158,23 +233,32 @@ fn decode_framed(payload: &[u8], n: usize) -> Vec<u8> {
     }
 
     // Decode segments in parallel, then concatenate in order.
-    let parts: Vec<Vec<u8>> = jobs
+    let parts: Option<Vec<Vec<u8>>> = jobs
         .par_iter()
-        .map(|&(p, len)| decode_segment(p, len, turbo))
+        .map(|&(p, len)| decode_segment(p, len, turbo, ctrl))
         .collect();
+    let parts = parts?;
 
     let mut out = Vec::with_capacity(n);
     for p in parts {
         out.extend_from_slice(&p);
     }
-    out
+    Some(out)
 }
 
-/// Compress a single segment (no framing).
-fn encode_segment(data: &[u8], turbo: bool) -> Vec<u8> {
+/// Compress a single segment (no framing). Returns `None` if cancelled.
+fn encode_segment(data: &[u8], turbo: bool, ctrl: &Control) -> Option<Vec<u8>> {
     let mut model = Predictor::new(data.len(), turbo);
     let mut enc = Encoder::new();
+    let mut since_check = 0usize;
     for &byte in data {
+        if since_check >= CHECK_INTERVAL {
+            ctrl.add_done(since_check as u64);
+            since_check = 0;
+            if !ctrl.proceed() {
+                return None;
+            }
+        }
         // MSB-first bit coding through the shared per-byte context tree.
         for bit_index in (0..8).rev() {
             let bit = ((byte >> bit_index) & 1) as i32;
@@ -183,16 +267,26 @@ fn encode_segment(data: &[u8], turbo: bool) -> Vec<u8> {
             model.update(bit);
         }
         model.next_byte(byte);
+        since_check += 1;
     }
-    enc.finish()
+    ctrl.add_done(since_check as u64);
+    Some(enc.finish())
 }
 
-/// Decode a single segment of exactly `n` bytes.
-fn decode_segment(payload: &[u8], n: usize, turbo: bool) -> Vec<u8> {
+/// Decode a single segment of exactly `n` bytes. Returns `None` if cancelled.
+fn decode_segment(payload: &[u8], n: usize, turbo: bool, ctrl: &Control) -> Option<Vec<u8>> {
     let mut model = Predictor::new(n, turbo);
     let mut dec = Decoder::new(payload);
     let mut out = Vec::with_capacity(n);
+    let mut since_check = 0usize;
     for _ in 0..n {
+        if since_check >= CHECK_INTERVAL {
+            ctrl.add_done(since_check as u64);
+            since_check = 0;
+            if !ctrl.proceed() {
+                return None;
+            }
+        }
         let mut byte = 0u8;
         for _ in 0..8 {
             let p = model.predict();
@@ -202,8 +296,10 @@ fn decode_segment(payload: &[u8], n: usize, turbo: bool) -> Vec<u8> {
         }
         model.next_byte(byte);
         out.push(byte);
+        since_check += 1;
     }
-    out
+    ctrl.add_done(since_check as u64);
+    Some(out)
 }
 
 #[cfg(test)]
@@ -222,8 +318,9 @@ mod tests {
     /// needs no hint. Both model profiles are exercised.
     fn roundtrip_segmented(data: &[u8], seg: usize) {
         for turbo in [false, true] {
-            let payload = encode_framed(data, seg, turbo);
-            let decoded = decode_framed(&payload, data.len());
+            let ctrl = Control::new();
+            let payload = encode_framed(data, seg, turbo, &ctrl).unwrap();
+            let decoded = decode_framed(&payload, data.len(), &Control::new()).unwrap();
             assert_eq!(
                 decoded, data,
                 "segmented roundtrip mismatch (seg={seg}, turbo={turbo}, {} bytes)",
@@ -267,13 +364,38 @@ mod tests {
 
     #[test]
     fn segmentation_is_transparent_to_ratio() {
-        // One big segment vs many small ones should both round-trip; this also
-        // documents that segmentation only adds the small per-segment header.
         let s = "compression test data ".repeat(2000);
-        let one = encode_framed(s.as_bytes(), s.len() + 1, false);
-        let many = encode_framed(s.as_bytes(), 4096, false);
-        assert_eq!(decode_framed(&one, s.len()), s.as_bytes());
-        assert_eq!(decode_framed(&many, s.len()), s.as_bytes());
+        let c = Control::new();
+        let one = encode_framed(s.as_bytes(), s.len() + 1, false, &c).unwrap();
+        let many = encode_framed(s.as_bytes(), 4096, false, &Control::new()).unwrap();
+        assert_eq!(decode_framed(&one, s.len(), &Control::new()).unwrap(), s.as_bytes());
+        assert_eq!(decode_framed(&many, s.len(), &Control::new()).unwrap(), s.as_bytes());
+    }
+
+    #[test]
+    fn cancel_aborts_encode() {
+        let data = vec![b'x'; 2_000_000];
+        let ctrl = Control::new();
+        ctrl.cancel();
+        let out = encode_with_control(&data, 1, &ctrl);
+        assert!(out.is_none(), "cancelled encode should return None");
+    }
+
+    #[test]
+    fn control_reports_progress() {
+        let data = vec![b'y'; 200_000];
+        let ctrl = Control::new();
+        let _ = encode_with_control(&data, 1, &ctrl);
+        assert_eq!(ctrl.bytes_done(), data.len() as u64, "all bytes should be counted");
+    }
+
+    #[test]
+    fn uncancelled_control_roundtrips() {
+        let data = b"control path must be lossless too".repeat(50);
+        let ctrl = Control::new();
+        let payload = encode_with_control(&data, 5, &ctrl).unwrap();
+        let back = decode_with_control(&payload, data.len(), &Control::new()).unwrap();
+        assert_eq!(back, data);
     }
 
     #[test]

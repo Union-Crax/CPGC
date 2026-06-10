@@ -205,39 +205,65 @@ Input → Content Analyzer → Transform Preprocessor → CPGC-NX context mixer 
 
 ---
 
-## Build
+## Download pre-built binaries
+
+Every `v*` tag triggers a GitHub Actions workflow that publishes three assets:
+
+| Asset | Contents |
+|---|---|
+| `cpgc-x86_64-pc-windows-msvc.zip` | `cpgc.exe` (CLI) + `cpgc-gui.exe` (GUI) |
+| `CPGC-Setup.exe` | Windows installer (Start Menu, optional PATH + shell menu) |
+| `cpgc-x86_64-unknown-linux-gnu.tar.gz` | CLI + GUI, statically linked |
+| `cpgc-x86_64-apple-darwin.tar.gz` | CLI + GUI for macOS |
+
+Download from the [Releases page](https://github.com/Union-Crax/CPGC/releases).
+
+---
+
+## Build from source
+
+The CLI and GUI are **separate binaries** — build only what you need:
 
 ```sh
-cargo build --release          # includes the native GUI (default)
-cargo build --release --no-default-features   # lean CLI-only binary
+# CLI only (no GUI deps, fast compile)
+cargo build --release --bin cpgc
+
+# Native desktop GUI
+cargo build --release --features gui --bin cpgc-gui
+
+# Both at once
+cargo build --release --bin cpgc && cargo build --release --features gui --bin cpgc-gui
 ```
 
-Binary: `target/release/cpgc`
+Binaries land in `target/release/`.
+
+On Linux the GUI requires a few system libraries (installed automatically in
+CI; on a dev box: `libxcb-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev`).
 
 ---
 
 ## GUI (native 7-Zip-style app)
 
 ```sh
-cpgc gui                       # opens a desktop window
-cpgc gui --dir /data           # start in a specific folder
-cpgc gui --open archive.cpgc   # open an archive directly (used by Explorer)
+cpgc-gui                       # browse from the current directory
+cpgc-gui /path/to/dir          # start in a specific folder
+cpgc-gui archive.cpgc          # open an archive directly (used by Explorer)
 ```
 
-`cpgc gui` opens a real native window (egui/eframe — no browser):
+`cpgc-gui` opens a real native window (egui/eframe — no browser):
 
-- **Browse** folders with a clickable **breadcrumb address bar**, **Up** and
-  **Refresh**, and a file list with **Name / Size / Modified / Type** columns.
-  **Double-click** a folder to enter it or an archive to open it; tick items (or
-  use the header **select-all** box) and click **Add to archive** to make a
-  `.cpgc` single-file or `.cpas` solid archive.
-- **Open an archive** to browse its contents, tick individual members and
-  **Extract selected** / **Extract all**, or **Test** that it decodes correctly.
-- Long operations run on a background thread with a live progress bar.
+- **Menu bar** — File / View (light⇄dark toggle) / Help.
+- **Toolbar** — Up, Add, Extract, Info, level combo, clickable breadcrumb path.
+- **Browse** folders; **double-click** a folder to enter it or an archive to
+  open it; tick items (or use the header **select-all** box) and click
+  **Add to archive** to make a `.cpgc` single-file or `.cpas` solid archive.
+- **Open an archive** to browse its members; tick individual files and
+  **Extract selected** / **Extract all**; **Test** verifies the checksum.
+- Long operations run on a background thread. The **status bar** shows a live
+  MB/s readout and **Pause / Resume / Cancel** buttons.
 
-It is cross-platform (Windows/macOS/Linux) and needs a graphical desktop to
-run; on a headless machine it exits with a clear "no display" message — use the
-CLI there.
+It is cross-platform (Windows/macOS/Linux) and needs a graphical desktop; on a
+headless machine it exits with a clear "no display" message — use the CLI.
 
 ---
 

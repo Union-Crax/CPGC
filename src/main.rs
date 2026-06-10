@@ -49,15 +49,6 @@ enum Commands {
     Info {
         archive: PathBuf,
     },
-    /// Launch the native desktop GUI (7-Zip-style file manager)
-    Gui {
-        /// Directory to open in the file browser (default: current directory)
-        #[arg(short, long)]
-        dir: Option<PathBuf>,
-        /// Open this archive directly (used by the Explorer "Open with CPGC" verb)
-        #[arg(long)]
-        open: Option<PathBuf>,
-    },
     /// Install the Windows right-click menu (per-user; no admin needed)
     Register,
     /// Remove the Windows right-click menu entries
@@ -73,7 +64,6 @@ fn main() -> Result<()> {
         Commands::List { archive }                   => cmd_list(&archive),
         Commands::Bench { corpus_dir }               => cmd_bench(&corpus_dir),
         Commands::Info { archive }                   => cmd_info(&archive),
-        Commands::Gui { dir, open }                   => cmd_gui(dir, open),
         Commands::Register                            => cmd_register(),
         Commands::Unregister                          => cmd_unregister(),
     }
@@ -262,23 +252,6 @@ fn cmd_verify(archive: &PathBuf) -> Result<()> {
         );
     }
     Ok(())
-}
-
-#[cfg(feature = "gui")]
-fn cmd_gui(dir: Option<PathBuf>, open: Option<PathBuf>) -> Result<()> {
-    // If an archive was passed (Explorer "Open with CPGC"), start in its folder
-    // and open it; otherwise browse `dir` (or the current directory).
-    let start = open
-        .as_ref()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .or(dir)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    cpgc::gui::run(start, open)
-}
-
-#[cfg(not(feature = "gui"))]
-fn cmd_gui(_dir: Option<PathBuf>, _open: Option<PathBuf>) -> Result<()> {
-    bail!("this binary was built without the `gui` feature; rebuild with `cargo build --features gui`")
 }
 
 fn cmd_info(archive: &PathBuf) -> Result<()> {

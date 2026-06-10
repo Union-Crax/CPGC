@@ -24,3 +24,7 @@ Thumbs.db
 
 # Dev notes
 dev.md
+
+# Inno Setup output
+/dist/
+/installer/Output/

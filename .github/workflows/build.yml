@@ -1,0 +1,163 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+    tags:     ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+
+      - name: Build CLI binary
+        run: cargo build --release --bin cpgc
+
+      - name: Build GUI binary
+        run: cargo build --release --features gui --bin cpgc-gui
+
+      - name: Run tests
+        run: cargo test --release --features gui
+
+      # -----------------------------------------------------------------------
+      # Package: Linux / macOS  →  .tar.gz
+      # -----------------------------------------------------------------------
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -e
+          OS="${{ runner.os }}"
+          if [ "$OS" = "Linux" ]; then TRIPLE="x86_64-unknown-linux-gnu"; else TRIPLE="x86_64-apple-darwin"; fi
+          DIR="cpgc-${TRIPLE}"
+          mkdir -p "$DIR"
+          cp target/release/cpgc     "$DIR/cpgc"
+          cp target/release/cpgc-gui "$DIR/cpgc-gui"
+          cp README.md               "$DIR/README.md"
+          tar czf "cpgc-${TRIPLE}.tar.gz" "$DIR"
+          echo "ASSET_PATH=cpgc-${TRIPLE}.tar.gz" >> $GITHUB_ENV
+          echo "ASSET_NAME=cpgc-${TRIPLE}.tar.gz" >> $GITHUB_ENV
+
+      # -----------------------------------------------------------------------
+      # Package: Windows  →  .zip  +  Inno Setup  →  CPGC-Setup.exe
+      # -----------------------------------------------------------------------
+      - name: Package (Windows zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = "cpgc-x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item target\release\cpgc.exe     $dir\
+          Copy-Item target\release\cpgc-gui.exe $dir\
+          Copy-Item README.md                   $dir\
+          Compress-Archive -Path $dir -DestinationPath "cpgc-x86_64-pc-windows-msvc.zip" -Force
+          echo "ZIP_PATH=cpgc-x86_64-pc-windows-msvc.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Install Inno Setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $iscc = (Get-ChildItem "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" -ErrorAction SilentlyContinue |
+                   Select-Object -First 1 -ExpandProperty FullName)
+          if (-not $iscc) {
+            $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
+          }
+          if (-not $iscc) { Write-Error "ISCC.exe not found"; exit 1 }
+          $version = "${{ github.ref_name }}" -replace '^v',''
+          if (-not $version) { $version = "0.0.0-dev" }
+          & $iscc "/DMyAppVersion=$version" "installer\cpgc.iss"
+          echo "INSTALLER_PATH=installer\Output\CPGC-Setup.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # -----------------------------------------------------------------------
+      # Upload build artifacts (always, not just on tags)
+      # -----------------------------------------------------------------------
+      - name: Upload CLI artifact (Unix)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpgc-cli-${{ runner.os }}
+          path: ${{ env.ASSET_PATH }}
+          retention-days: 14
+
+      - name: Upload CLI artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: cpgc-cli-Windows
+          path: ${{ env.ZIP_PATH }}
+          retention-days: 14
+
+      - name: Upload installer artifact
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: CPGC-Setup
+          path: ${{ env.INSTALLER_PATH }}
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Publish a GitHub Release when a v* tag is pushed
+  # ---------------------------------------------------------------------------
+  release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+
+      - name: Flatten dist directory
+        run: find dist/ -type f | xargs -I{} mv {} dist/ 2>/dev/null || true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/cpgc-x86_64-unknown-linux-gnu.tar.gz
+            dist/cpgc-x86_64-apple-darwin.tar.gz
+            dist/cpgc-x86_64-pc-windows-msvc.zip
+            dist/CPGC-Setup.exe

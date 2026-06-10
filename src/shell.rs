@@ -32,24 +32,32 @@ fn exe_path() -> Result<String> {
     Ok(p.to_string_lossy().replace('/', "\\"))
 }
 
+/// Absolute path to `cpgc-gui.exe` (same directory as the running binary).
+fn gui_exe_path() -> Result<String> {
+    let p = std::env::current_exe().context("locating the cpgc executable")?;
+    let gui = p.with_file_name("cpgc-gui.exe");
+    Ok(gui.to_string_lossy().replace('/', "\\"))
+}
+
 /// Install the right-click menu entries for the current user.
 pub fn register() -> Result<()> {
-    let exe = exe_path()?;
+    let exe     = exe_path()?;
+    let gui_exe = gui_exe_path()?;
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
 
     // --- ProgID describing a CPGC archive --------------------------------
     let (k, _) = hkcu.create_subkey(format!(r"{CLASSES}\{PROGID}"))?;
     k.set_value("", &"CPGC Archive")?;
     let (ki, _) = hkcu.create_subkey(format!(r"{CLASSES}\{PROGID}\DefaultIcon"))?;
-    ki.set_value("", &format!("{exe},0"))?;
+    ki.set_value("", &format!("{gui_exe},0"))?;
 
     // Double-click / default verb → open the archive in the GUI.
     set_verb(
         &hkcu,
         &format!(r"{CLASSES}\{PROGID}\shell\open"),
         "Open with CPGC",
-        &format!("\"{exe}\" gui --open \"%1\""),
-        &exe,
+        &format!("\"{gui_exe}\" \"%1\""),
+        &gui_exe,
     )?;
     // Extract here → decompress beside the archive (console with progress).
     set_verb(
