@@ -1,33 +1,39 @@
 //! Top-level compress / decompress orchestration.
 //!
-//! ## File Format (VERSION 2)
+//! ## File Format (VERSION 7)
 //!
 //! ```text
 //! [0..4]                      magic: "CPGC"
-//! [4]                         version: 2
+//! [4]                         version: 7
 //! [5]                         flags: bit0 = has_passthrough, bit1 = has_transforms
 //! [6..14]                     orig_len: u64 LE
-//! [14..18]                    n_blocks: u32 LE  (= ceil(orig_len / BLOCK_SIZE))
-//! [18..18+n_blocks]           block_tags: one byte per block
-//!                               0x00 = LSTM+ANS, no transform
-//!                               0x01–0x08 = LSTM+ANS on transformed data (1-indexed into CANDIDATES)
-//!                               0xFF = passthrough (raw bytes, not run through LSTM)
-//! [18+n_blocks..22+n_blocks]  passthrough_len: u32 LE
-//! [22+n_blocks .. +passthrough_len]  raw bytes for passthrough blocks
-//! [rest]                      rANS payload for all non-passthrough blocks (in block order)
+//! [14..18]                    crc32: u32 LE  (CRC-32 of the original bytes)
+//! [18..22]                    n_blocks: u32 LE  (= ceil(orig_len / WINDOW_SIZE))
+//! [22..22+n_blocks]           block_tags: one byte per block
+//!                               0x00 = context-mixed, no transform
+//!                               0x01–0x08 = context-mixed on transformed data (1-indexed into CANDIDATES)
+//!                               0xFF = passthrough (raw bytes, not run through the mixer)
+//! [22+n_blocks..26+n_blocks]  passthrough_len: u32 LE
+//! [26+n_blocks .. +passthrough_len]  raw bytes for passthrough blocks
+//! [rest]                      context-mixer payload for all non-passthrough blocks (in block order)
 //! ```
 //!
-//! Level < 5: no classify / transform pass; all block_tags = 0x00; passthrough_len = 0.
-//! Level ≥ 5: content analyzer + transform search enabled.
+//! The CRC-32 is verified after decoding, so a corrupt archive — or one written
+//! by an incompatible model version — fails loudly instead of returning wrong
+//! bytes. Level < 5: no classify / transform pass; all block_tags = 0x00;
+//! passthrough_len = 0. Level ≥ 5: content analyzer + transform search enabled.
 
 use anyhow::{anyhow, Result};
 
 use crate::analyzer::classifier::{classify, WINDOW_SIZE};
 use crate::cm;
+use crate::checksum::crc32;
 use crate::transform::search::{find_best_transform, CANDIDATES};
 
 const MAGIC: &[u8; 4] = b"CPGC";
-const VERSION: u8 = 4;
+const VERSION: u8 = 7;
+/// Smallest possible header: magic+ver+flags+orig_len+crc32+n_blocks+passthrough_len.
+const HEADER_MIN: usize = 4 + 1 + 1 + 8 + 4 + 4 + 4;
 const TAG_NORMAL: u8 = 0x00;
 const TAG_PASSTHROUGH: u8 = 0xFF;
 
@@ -121,12 +127,13 @@ pub fn compress_with_progress(
         (if passthrough_data.is_empty() { 0u8 } else { 1u8 })
         | (if block_tags.iter().any(|&t| t != TAG_NORMAL && t != TAG_PASSTHROUGH) { 2u8 } else { 0u8 });
 
-    let total = 4 + 1 + 1 + 8 + 4 + n_blocks + 4 + passthrough_data.len() + ans_payload.len();
+    let total = HEADER_MIN + n_blocks + passthrough_data.len() + ans_payload.len();
     let mut out = Vec::with_capacity(total);
     out.extend_from_slice(MAGIC);
     out.push(VERSION);
     out.push(flags);
     out.extend_from_slice(&(n as u64).to_le_bytes());
+    out.extend_from_slice(&crc32(input).to_le_bytes());
     out.extend_from_slice(&(n_blocks as u32).to_le_bytes());
     out.extend_from_slice(&block_tags);
     out.extend_from_slice(&(passthrough_data.len() as u32).to_le_bytes());
@@ -141,25 +148,29 @@ pub fn compress_with_progress(
 
 /// Decompress bytes produced by `compress()`.
 pub fn decompress(input: &[u8]) -> Result<Vec<u8>> {
-    // Minimum header: magic(4) + version(1) + flags(1) + orig_len(8) + n_blocks(4) + passthrough_len(4) = 22
-    if input.len() < 22 {
+    if input.len() < HEADER_MIN {
         return Err(anyhow!("input too short for CPGC header"));
     }
     if &input[0..4] != MAGIC {
         return Err(anyhow!("invalid magic bytes"));
     }
     if input[4] != VERSION {
-        return Err(anyhow!("unsupported version {} (expected {})", input[4], VERSION));
+        return Err(anyhow!(
+            "unsupported CPGC version {} (this build reads version {}). \
+             Archives written by an older/newer build are not compatible.",
+            input[4], VERSION
+        ));
     }
     // input[5] = flags (reserved for decoder use; currently informational)
     let orig_len  = u64::from_le_bytes(input[6..14].try_into().unwrap()) as usize;
-    let n_blocks  = u32::from_le_bytes(input[14..18].try_into().unwrap()) as usize;
+    let crc_expected = u32::from_le_bytes(input[14..18].try_into().unwrap());
+    let n_blocks  = u32::from_le_bytes(input[18..22].try_into().unwrap()) as usize;
 
-    let tags_end = 18 + n_blocks;
+    let tags_end = 22 + n_blocks;
     if input.len() < tags_end + 4 {
         return Err(anyhow!("truncated block table"));
     }
-    let block_tags = &input[18..tags_end];
+    let block_tags = &input[22..tags_end];
     let pt_len = u32::from_le_bytes(input[tags_end..tags_end + 4].try_into().unwrap()) as usize;
 
     let pt_start  = tags_end + 4;
@@ -171,6 +182,9 @@ pub fn decompress(input: &[u8]) -> Result<Vec<u8>> {
     let ans_payload      = &input[ans_start..];
 
     if orig_len == 0 {
+        if crc_expected != crc32(&[]) {
+            return Err(anyhow!("checksum mismatch on empty archive (corrupt header)"));
+        }
         return Ok(Vec::new());
     }
 
@@ -228,6 +242,17 @@ pub fn decompress(input: &[u8]) -> Result<Vec<u8>> {
             CANDIDATES[tag_idx].invert(&mut block);
             output.extend_from_slice(&block);
         }
+    }
+
+    // Integrity check: a mismatch means the archive is corrupt or was written
+    // by an incompatible model, so we must not hand back wrong bytes silently.
+    let crc_actual = crc32(&output);
+    if crc_actual != crc_expected {
+        return Err(anyhow!(
+            "checksum mismatch: archive is corrupt or was written by an \
+             incompatible version (expected {:#010x}, got {:#010x})",
+            crc_expected, crc_actual
+        ));
     }
 
     Ok(output)

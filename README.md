@@ -20,22 +20,49 @@ is never stored in the output.
 The predictor is a new *combination* (the bit-level context-mixing framework is
 shared with the PAQ family, but the model below is specific to this codec):
 
-- **Dual learning-rate counters** — each context slot stores a *fast* and a
-  *slow* adaptive probability; both are fed to the mixer, so it can trust the
-  fast estimate during local change and the slow one when stationary.
-- **Verified long-match model** — a rolling-hash pointer into the decoded
-  history finds the most recent occurrence of the current suffix, *verifies* it
-  by extending backward (rejecting hash collisions) and measures the true match
-  length, then forecasts the bit of the continuation with confidence that grows
+- **Universal bit-history states** — every hashed context slot is a *single
+  packed byte*: capped counts of observed 0s and 1s where incrementing one
+  count discounts the other, so each state encodes both the evidence and its
+  recency. A learned per-model **state map** (count-adaptive rate,
+  `p += (target − p)/(count + 2)`) converts the state to a probability, and a
+  closed-form Krichevsky–Trofimov estimate of the same state is fed to the
+  mixer alongside it — a fast view and a converging view from one byte of
+  state, at one sixth the memory of explicit dual counters. The small
+  collision-free order-0/1 tables keep explicit fast/slow dual counters.
+- **Nibble-bucketed, checksummed hash tables** — context slots live in
+  16-byte buckets holding the full 15-node subtree of one nibble, so *one
+  hash lookup and one cache line serve four bits* (v6 took a fresh random
+  lookup per model per bit — at these table sizes the predictor is memory-
+  latency-bound, and this is where most of v7's ~2.4x speedup comes from).
+  Bucket addresses are prefetched as soon as they are computable (one bit
+  early), overlapping the misses with mixer training. A one-byte checksum
+  detects collisions and a two-candidate replacement policy evicts the
+  less-established bucket, so colliding contexts no longer silently corrupt
+  each other's statistics — worth ratio as well as speed.
+- **Dual verified long-match model** — two rolling-hash pointers (8-byte and
+  4-byte suffix; the longer anchor is tried first) into the decoded history
+  find the most recent occurrence of the current suffix, *verify* it by
+  extending backward (rejecting hash collisions) and measure the true match
+  length, then forecast the bit of the continuation with confidence that grows
   with that length. Long verified matches are predicted near-certainly, which
   is what captures long-range redundancy and drives structured data well below
   1 bpb.
-- **Context models** at orders 0,1,2,3,4,6 plus a whitespace-delimited word
-  model, hashed into input-sized tables.
-- **Two-context mixing layer** — predictions are mixed by two weight sets
-  (selected by the previous byte and by match-length) and averaged in the
-  logistic domain, then trained online by gradient descent on coding loss.
-- **Chained SSE** — two adaptive probability maps refine the mixed estimate.
+- **Context models** at orders 0,1,2,3,4,5,6,7 plus a whitespace-delimited word
+  model, a previous-word/current-word **word-pair model**, six **sparse
+  contexts** (skip-grams and high-nibble views that pay off on structured
+  binary), and stride models (2,3,4,8) — eighteen bit-history models in all,
+  affordable because each costs one bucket lookup per nibble, not per bit.
+- **Two-layer logistic mixer** — four first-layer weight sets (selected by the
+  previous byte, the byte before it, the match-length bucket, and the partial
+  byte being decoded) each produce a prediction; a small learned second layer,
+  selected by (match length, bit position), then combines them. Both layers are
+  trained online by gradient descent on coding loss — strictly more general
+  than averaging the views.
+- **Chained SSE** — four adaptive probability maps refine the mixed estimate.
+
+Every archive stores a **CRC-32 of the original bytes**, verified after
+decoding: a corrupt archive — or one written by an incompatible model version —
+fails loudly instead of returning wrong bytes.
 
 Table sizes are derived deterministically from the byte count (which both
 sides know), so small inputs stay cheap and large inputs get the full model
@@ -55,6 +82,28 @@ with cores — so on big archives CPGC-NX is not only smaller than xz but
 ---
 
 ## Measured results
+
+> **Note:** the reference table below predates the current (v7) engine. The
+> lineage: v5 added count-adaptive counters, orders 0–7 and a two-layer
+> learned mixer; v6 added indirect bit-history models, a word-pair context, a
+> dual match model and a partial-byte mixer view + APM; v7 rebuilt the entire
+> model state around nibble-bucketed, checksummed bit-history states — which
+> made it **both ~5% smaller and ~2.4x faster than v6 at once** (memory
+> traffic, not arithmetic, was the bottleneck). The figures below are
+> therefore conservative.
+>
+> Fresh v7 measurements on the current `corpus/` files (level 9, verified
+> round-trips), against every big-name tool at its maximum setting:
+>
+> | file | orig | **CPGC-NX v7** | v6 | xz -9e | brotli -q11 | bzip2 -9 |
+> |---|--:|--:|--:|--:|--:|--:|
+> | code.txt (source) | 262,949 | **46,918** | 48,539 | 57,936 | 56,005 | 57,808 |
+> | english.txt (prose) | 738,046 | **162,092** | 163,168 | 216,120 | 212,481 | 186,325 |
+> | exe.bin (executable) | 1,148,450 | **320,997** | 346,265 | 393,420 | 399,862 | 458,841 |
+>
+> v7 wins every row — 13–18% smaller than the best big-name runner-up — while
+> single-segment throughput roughly **2.4x'd** over v6 (exe.bin: 8.8 s → 3.5 s
+> to compress, 8.4 s → 3.4 s to decompress).
 
 Compressed size in bytes (smaller is better), with verified lossless
 round-trips. Reference tools at maximum setting (`-9`).
@@ -84,8 +133,9 @@ through, so there is no expansion blow-up.
   times) xz's 64 MB LZ window wins, because such repeats can straddle the
   segment boundaries CPGC compresses independently. Real archives rarely look
   like this; on varied data segmentation costs almost nothing.
-- Single-segment throughput is ~0.4–0.8 MB/s (the cost of per-bit mixing);
-  parallelism is what lifts large-archive throughput past xz.
+- Single-segment throughput is ~0.3 MB/s with the full v7 model (the cost of
+  per-bit mixing over 18 models); parallelism across segments is what lifts
+  large-archive throughput past xz.
 
 The previous online-LSTM engine (which topped out around 2.95 bpb at ~0.4 MB/s)
 still lives in `src/predictor/` and `src/ans/` for reference, but is no longer
@@ -145,20 +195,44 @@ Binary: `target/release/cpgc`
 ```sh
 cpgc gui                       # opens a desktop window
 cpgc gui --dir /data           # start in a specific folder
+cpgc gui --open archive.cpgc   # open an archive directly (used by Explorer)
 ```
 
 `cpgc gui` opens a real native window (egui/eframe — no browser):
 
-- **Browse** folders, tick files or directories, choose a compression level,
-  and click **Compress** to make a `.cpgc` single-file or `.cpas` solid archive.
-- **Open an archive** (like opening a folder) to browse its contents, then tick
-  individual members and **Extract selected**, or **Extract all**. **Verify**
-  checks an archive decodes correctly.
+- **Browse** folders with a clickable **breadcrumb address bar**, **Up** and
+  **Refresh**, and a file list with **Name / Size / Modified / Type** columns.
+  **Double-click** a folder to enter it or an archive to open it; tick items (or
+  use the header **select-all** box) and click **Add to archive** to make a
+  `.cpgc` single-file or `.cpas` solid archive.
+- **Open an archive** to browse its contents, tick individual members and
+  **Extract selected** / **Extract all**, or **Test** that it decodes correctly.
 - Long operations run on a background thread with a live progress bar.
 
 It is cross-platform (Windows/macOS/Linux) and needs a graphical desktop to
 run; on a headless machine it exits with a clear "no display" message — use the
 CLI there.
+
+---
+
+## Windows right-click menu (7-Zip style)
+
+```sh
+cpgc register                  # install the Explorer context menu (per-user)
+cpgc unregister                # remove it
+```
+
+`cpgc register` writes a handful of keys under `HKCU\Software\Classes`, so it
+needs **no administrator rights** and touches nothing system-wide. It adds:
+
+- **Compress with CPGC** on every file and folder — runs `cpgc compress` and
+  drops a `.cpgc` / `.cpas` next to the item, in a console that shows progress.
+- For `.cpgc` / `.cpas` archives: **Open with CPGC** (also the double-click
+  action — opens the archive in the GUI), **Extract here**, and **Test CPGC
+  archive**.
+
+Register from a stable location: copy `cpgc.exe` somewhere permanent and run
+`register` from there, since the menu commands point at the exe's current path.
 
 ---
 
@@ -301,6 +375,9 @@ Best LR: **0.01** → 3.43 bits/byte
 - [x] Content analyzer wired for incompressible-region passthrough
 - [x] Solid multi-file archive (`cpgc compress dir/ archive.cpgc`, `cpgc list archive.cpgc`)
 - [x] Criterion benchmarks (`cargo bench`)
+- [x] CRC-32 integrity check, verified on decode (rejects corrupt / incompatible archives)
+- [x] Count-adaptive counters + two-layer learned mixer (context orders 0–7)
+- [x] Windows right-click shell integration (`cpgc register` / `cpgc unregister`)
 - [ ] True int8 runtime inference (hot-path dequantize-on-the-fly for better L2 cache utilization)
 - [ ] LR decay schedule (0.9999 per byte as recommended in plan)
 - [ ] Full enwik8 benchmark table vs zstd / LZMA

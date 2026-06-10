@@ -51,7 +51,14 @@ enum Commands {
         /// Directory to open in the file browser (default: current directory)
         #[arg(short, long)]
         dir: Option<PathBuf>,
+        /// Open this archive directly (used by the Explorer "Open with CPGC" verb)
+        #[arg(long)]
+        open: Option<PathBuf>,
     },
+    /// Install the Windows right-click menu (per-user; no admin needed)
+    Register,
+    /// Remove the Windows right-click menu entries
+    Unregister,
 }
 
 fn main() -> Result<()> {
@@ -63,8 +70,38 @@ fn main() -> Result<()> {
         Commands::List { archive }                   => cmd_list(&archive),
         Commands::Bench { corpus_dir }               => cmd_bench(&corpus_dir),
         Commands::Info { archive }                   => cmd_info(&archive),
-        Commands::Gui { dir }                         => cmd_gui(dir),
+        Commands::Gui { dir, open }                   => cmd_gui(dir, open),
+        Commands::Register                            => cmd_register(),
+        Commands::Unregister                          => cmd_unregister(),
     }
+}
+
+#[cfg(windows)]
+fn cmd_register() -> Result<()> {
+    cpgc::shell::register().context("writing shell-integration registry keys")?;
+    println!("✔ CPGC right-click menu installed (current user).");
+    println!("  • Right-click any file or folder → \"Compress with CPGC\"");
+    println!("  • Right-click a .cpgc / .cpas archive → \"Open with CPGC\", \"Extract here\", \"Test CPGC archive\"");
+    println!("  • Double-click a .cpgc / .cpas archive → opens the CPGC browser");
+    println!("Run `cpgc unregister` to remove these entries.");
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn cmd_register() -> Result<()> {
+    bail!("shell integration is only available on Windows");
+}
+
+#[cfg(windows)]
+fn cmd_unregister() -> Result<()> {
+    cpgc::shell::unregister().context("removing shell-integration registry keys")?;
+    println!("✔ CPGC right-click menu removed.");
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn cmd_unregister() -> Result<()> {
+    bail!("shell integration is only available on Windows");
 }
 
 /// Derive a default output path for compression: append `.cpgc`.
@@ -225,13 +262,19 @@ fn cmd_verify(archive: &PathBuf) -> Result<()> {
 }
 
 #[cfg(feature = "gui")]
-fn cmd_gui(dir: Option<PathBuf>) -> Result<()> {
-    let dir = dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    cpgc::gui::run(dir)
+fn cmd_gui(dir: Option<PathBuf>, open: Option<PathBuf>) -> Result<()> {
+    // If an archive was passed (Explorer "Open with CPGC"), start in its folder
+    // and open it; otherwise browse `dir` (or the current directory).
+    let start = open
+        .as_ref()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .or(dir)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    cpgc::gui::run(start, open)
 }
 
 #[cfg(not(feature = "gui"))]
-fn cmd_gui(_dir: Option<PathBuf>) -> Result<()> {
+fn cmd_gui(_dir: Option<PathBuf>, _open: Option<PathBuf>) -> Result<()> {
     bail!("this binary was built without the `gui` feature; rebuild with `cargo build --features gui`")
 }
 
@@ -251,14 +294,15 @@ fn cmd_info(archive: &PathBuf) -> Result<()> {
         return Ok(());
     }
 
-    // VERSION 2 single-file header layout:
+    // VERSION 5 single-file header layout:
     //   [0..4]   magic "CPGC"
     //   [4]      version
     //   [5]      flags
     //   [6..14]  orig_len u64 LE
-    //   [14..18] n_blocks u32 LE
-    //   [18+n_blocks..22+n_blocks] passthrough_len u32 LE
-    const MIN: usize = 22;
+    //   [14..18] crc32 u32 LE
+    //   [18..22] n_blocks u32 LE
+    //   [22+n_blocks..26+n_blocks] passthrough_len u32 LE
+    const MIN: usize = 26;
     if data.len() < MIN {
         bail!("file too small to be a CPGC archive");
     }
@@ -268,8 +312,9 @@ fn cmd_info(archive: &PathBuf) -> Result<()> {
     let version   = data[4];
     let flags     = data[5];
     let orig_len  = u64::from_le_bytes(data[6..14].try_into().unwrap());
-    let n_blocks  = u32::from_le_bytes(data[14..18].try_into().unwrap()) as usize;
-    let pt_len_off = 18 + n_blocks;
+    let crc       = u32::from_le_bytes(data[14..18].try_into().unwrap());
+    let n_blocks  = u32::from_le_bytes(data[18..22].try_into().unwrap()) as usize;
+    let pt_len_off = 22 + n_blocks;
     let passthrough_len = if data.len() >= pt_len_off + 4 {
         u32::from_le_bytes(data[pt_len_off..pt_len_off + 4].try_into().unwrap()) as usize
     } else { 0 };
@@ -282,8 +327,9 @@ fn cmd_info(archive: &PathBuf) -> Result<()> {
     println!("  flags:          0x{:02x}  ({}{})", flags,
         if flags & 1 != 0 { "passthrough " } else { "" },
         if flags & 2 != 0 { "transforms" } else { "" });
+    println!("  crc32:          {:#010x}", crc);
     println!("  original size:  {} bytes", orig_len);
-    println!("  compressed:     {} bytes  (ANS payload: {} bytes, passthrough: {} bytes)",
+    println!("  compressed:     {} bytes  (mixer payload: {} bytes, passthrough: {} bytes)",
         data.len(), ans_payload, passthrough_len);
     println!("  blocks:         {} × {}B", n_blocks, cpgc::analyzer::classifier::WINDOW_SIZE);
     println!("  ratio:          {:.4}", ratio);

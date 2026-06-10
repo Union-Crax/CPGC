@@ -8,15 +8,19 @@
 //! the model here is a distinct combination tuned for this codec (see
 //! [`predictor`] for the details):
 //!
-//! 1. **Dual learning-rate counters** — every context slot carries a fast and
-//!    a slow probability estimate, both exposed to the mixer.
-//! 2. **An integrated long-match model** — a rolling-hash pointer into history
-//!    forecasts the bit of the most recent matching continuation.
-//! 3. **A two-context mixing layer** — predictions are mixed by two weight sets
-//!    (selected by the previous byte and by match-length) and averaged in the
-//!    logistic domain.
-//! 4. **A chained SSE stage** refines the result before the binary arithmetic
-//!    coder.
+//! 1. **Universal bit-history states** — every hashed context slot is one
+//!    packed byte of mutually-discounting 0/1 counts, read through a learned
+//!    per-model state map, capturing nonstationary structure counters miss.
+//! 2. **Nibble-bucketed, checksummed hash tables** — one prefetched cache
+//!    line serves four bits and collisions are detected instead of silently
+//!    corrupting predictions; this is where v7's ~2.4x speedup comes from.
+//! 3. **A dual long-match model** — 8-byte and 4-byte rolling-hash pointers
+//!    into history forecast the bit of the most recent matching continuation.
+//! 4. **A two-layer learned mixer** — four context-selected weight sets
+//!    (previous byte, byte before it, match length, partial byte) feed a
+//!    small second-layer combiner trained online on coding loss.
+//! 5. **A chained SSE stage** (four APMs) refines the result before the
+//!    binary arithmetic coder.
 //!
 //! ## Scaling to big archives
 //!

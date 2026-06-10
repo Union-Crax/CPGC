@@ -16,11 +16,13 @@ use eframe::egui;
 use crate::archive::solid::SolidArchive;
 use crate::codec;
 
-/// Launch the GUI. `start_dir` is the initial directory shown.
-pub fn run(start_dir: PathBuf) -> Result<()> {
+/// Launch the GUI. `start_dir` is the initial directory shown; if `open_archive`
+/// is set (Explorer "Open with CPGC"), that archive is opened on start.
+pub fn run(start_dir: PathBuf, open_archive: Option<PathBuf>) -> Result<()> {
     let start_dir = start_dir
         .canonicalize()
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let open_archive = open_archive.and_then(|p| p.canonicalize().ok());
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -33,7 +35,7 @@ pub fn run(start_dir: PathBuf) -> Result<()> {
     eframe::run_native(
         "CPGC",
         options,
-        Box::new(move |_cc| Box::new(CpgcApp::new(start_dir))),
+        Box::new(move |_cc| Box::new(CpgcApp::new(start_dir, open_archive))),
     )
     .map_err(|e| anyhow!("GUI failed to start: {e}"))
 }
@@ -48,6 +50,20 @@ struct Entry {
     is_dir: bool,
     is_archive: bool,
     size: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl Entry {
+    /// 7-Zip-style "Type" column text.
+    fn type_label(&self) -> &'static str {
+        if self.is_dir {
+            "Folder"
+        } else if self.is_archive {
+            "CPGC Archive"
+        } else {
+            "File"
+        }
+    }
 }
 
 /// State for browsing *inside* an opened archive (7-Zip style).
@@ -92,7 +108,7 @@ struct CpgcApp {
 }
 
 impl CpgcApp {
-    fn new(cwd: PathBuf) -> Self {
+    fn new(cwd: PathBuf, open_archive: Option<PathBuf>) -> Self {
         let mut app = Self {
             cwd,
             entries: Vec::new(),
@@ -107,6 +123,11 @@ impl CpgcApp {
             arc_selected: BTreeSet::new(),
         };
         app.refresh();
+        // Launched via the Explorer "Open with CPGC" verb: jump straight into
+        // browsing the archive.
+        if let Some(arc) = open_archive {
+            app.open_archive(arc);
+        }
         app
     }
 
@@ -116,13 +137,13 @@ impl CpgcApp {
             for e in rd.flatten() {
                 let path = e.path();
                 let name = e.file_name().to_string_lossy().to_string();
-                let (is_dir, size) = match e.metadata() {
-                    Ok(m) => (m.is_dir(), m.len()),
-                    Err(_) => (false, 0),
+                let (is_dir, size, modified) = match e.metadata() {
+                    Ok(m) => (m.is_dir(), m.len(), m.modified().ok()),
+                    Err(_) => (false, 0, None),
                 };
                 let lower = name.to_lowercase();
                 let is_archive = lower.ends_with(".cpgc") || lower.ends_with(".cpas");
-                self.entries.push(Entry { path, name, is_dir, is_archive, size });
+                self.entries.push(Entry { path, name, is_dir, is_archive, size, modified });
             }
         }
         self.entries.sort_by(|a, b| {
@@ -325,14 +346,18 @@ impl CpgcApp {
 
     fn files_toolbar(&mut self, ui: &mut egui::Ui) {
         let busy = self.busy();
+        let mut nav_to: Option<PathBuf> = None;
         ui.horizontal_wrapped(|ui| {
             ui.heading("📦 CPGC");
             ui.separator();
             ui.add_enabled_ui(!busy, |ui| {
-                if ui.button("⬆ Up").clicked() {
+                if ui.button("⬆ Up").on_hover_text("Parent folder").clicked() {
                     if let Some(parent) = self.cwd.parent() {
-                        self.navigate(parent.to_path_buf());
+                        nav_to = Some(parent.to_path_buf());
                     }
+                }
+                if ui.button("🔄").on_hover_text("Refresh").clicked() {
+                    self.refresh();
                 }
             });
             ui.label(format!("{} selected", self.selected.len()));
@@ -352,16 +377,40 @@ impl CpgcApp {
             ui.add(egui::TextEdit::singleline(&mut self.out_name).desired_width(160.0));
 
             ui.add_enabled_ui(!busy && !self.selected.is_empty(), |ui| {
-                if ui.button("🗜 Compress").clicked() {
+                if ui
+                    .button("🗜 Add to archive")
+                    .on_hover_text("Compress the ticked items")
+                    .clicked()
+                {
                     self.start_compress();
                 }
             });
         });
         ui.add_space(2.0);
-        ui.horizontal(|ui| {
+        // Clickable breadcrumb address bar (each ancestor navigates there).
+        ui.horizontal_wrapped(|ui| {
             ui.label("📂");
-            ui.monospace(self.cwd.to_string_lossy());
+            let mut ancestors: Vec<PathBuf> = self.cwd.ancestors().map(|p| p.to_path_buf()).collect();
+            ancestors.reverse();
+            let last = ancestors.len().saturating_sub(1);
+            for (i, p) in ancestors.iter().enumerate() {
+                let label = p
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| p.to_string_lossy().to_string());
+                if i == last {
+                    ui.strong(label);
+                } else {
+                    if ui.add(egui::Button::new(label).frame(false)).clicked() {
+                        nav_to = Some(p.clone());
+                    }
+                    ui.weak("›");
+                }
+            }
         });
+        if let Some(p) = nav_to {
+            self.navigate(p);
+        }
     }
 
     fn archive_toolbar(&mut self, ui: &mut egui::Ui) {
@@ -395,6 +444,15 @@ impl CpgcApp {
             ui.add_enabled_ui(!busy, |ui| {
                 if ui.button("⬇ Extract all").clicked() {
                     self.start_extract_members(false);
+                }
+            });
+            ui.separator();
+            let arc_path = self.archive.as_ref().map(|a| a.path.clone());
+            ui.add_enabled_ui(!busy, |ui| {
+                if ui.button("🧪 Test").on_hover_text("Verify the archive decodes correctly").clicked() {
+                    if let Some(p) = arc_path {
+                        self.start_verify(p);
+                    }
                 }
             });
         });
@@ -440,20 +498,30 @@ impl CpgcApp {
         let mut nav_to: Option<PathBuf> = None;
         let mut toggle: Option<PathBuf> = None;
         let mut open: Option<PathBuf> = None;
-        let mut verify: Option<PathBuf> = None;
+        let mut select_all: Option<bool> = None;
         let busy = self.busy();
+        let all_selected = !self.entries.is_empty()
+            && self.entries.iter().all(|e| self.selected.contains(&e.path));
 
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 egui::Grid::new("files")
-                    .num_columns(4)
+                    .num_columns(5)
                     .striped(true)
-                    .spacing([12.0, 6.0])
+                    .spacing([14.0, 6.0])
                     .show(ui, |ui| {
-                        ui.strong("");
+                        // Header row: the first cell is a select-all checkbox.
+                        let mut all = all_selected;
+                        if ui.add_enabled(!busy, egui::Checkbox::without_text(&mut all))
+                            .on_hover_text("Select all / none")
+                            .changed()
+                        {
+                            select_all = Some(all);
+                        }
                         ui.strong("Name");
                         ui.strong("Size");
-                        ui.strong("Action");
+                        ui.strong("Modified");
+                        ui.strong("Type");
                         ui.end_row();
 
                         for e in &self.entries {
@@ -463,7 +531,8 @@ impl CpgcApp {
                                 toggle = Some(e.path.clone());
                             }
 
-                            // Name — folders navigate, files toggle selection.
+                            // Name — single click selects, double click opens
+                            // (navigate into folders, browse into archives).
                             let icon = if e.is_dir {
                                 "📁"
                             } else if e.is_archive {
@@ -472,11 +541,20 @@ impl CpgcApp {
                                 "📄"
                             };
                             let label = format!("{icon} {}", e.name);
-                            if e.is_dir {
-                                if ui.add_enabled(!busy, egui::Button::new(label).frame(false)).clicked() {
+                            let resp = ui
+                                .add(egui::SelectableLabel::new(sel, label))
+                                .on_hover_text(if e.is_dir || e.is_archive {
+                                    "Double-click to open"
+                                } else {
+                                    "Click to select"
+                                });
+                            if resp.double_clicked() {
+                                if e.is_dir {
                                     nav_to = Some(e.path.clone());
+                                } else if e.is_archive {
+                                    open = Some(e.path.clone());
                                 }
-                            } else if ui.add(egui::SelectableLabel::new(sel, label)).clicked() {
+                            } else if resp.clicked() {
                                 toggle = Some(e.path.clone());
                             }
 
@@ -487,25 +565,24 @@ impl CpgcApp {
                                 ui.monospace(human_size(e.size));
                             }
 
-                            // Per-row actions for archives: open to browse, or verify.
-                            ui.horizontal(|ui| {
-                                if e.is_archive {
-                                    ui.add_enabled_ui(!busy, |ui| {
-                                        if ui.button("Open").clicked() {
-                                            open = Some(e.path.clone());
-                                        }
-                                        if ui.button("Verify").clicked() {
-                                            verify = Some(e.path.clone());
-                                        }
-                                    });
-                                }
-                            });
+                            // Modified + Type columns (7-Zip style).
+                            ui.label(format_modified(e.modified));
+                            ui.label(e.type_label());
                             ui.end_row();
                         }
                     });
             });
         });
 
+        if let Some(all) = select_all {
+            if all {
+                for e in &self.entries {
+                    self.selected.insert(e.path.clone());
+                }
+            } else {
+                self.selected.clear();
+            }
+        }
         if let Some(p) = toggle {
             if !self.selected.remove(&p) {
                 self.selected.insert(p);
@@ -516,9 +593,6 @@ impl CpgcApp {
         }
         if let Some(p) = open {
             self.open_archive(p);
-        }
-        if let Some(p) = verify {
-            self.start_verify(p);
         }
     }
 
@@ -736,6 +810,37 @@ fn strip_ext(name: &str) -> String {
     } else {
         name.to_string()
     }
+}
+
+/// Format a file's modified time as `YYYY-MM-DD HH:MM` (UTC). Kept dependency
+/// free — the project has no date/time crate — so this shows UTC rather than
+/// local time.
+fn format_modified(t: Option<std::time::SystemTime>) -> String {
+    let Some(t) = t else { return "—".to_string() };
+    let secs = match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(_) => return "—".to_string(),
+    };
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, mi) = (rem / 3600, (rem % 3600) / 60);
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}")
+}
+
+/// Convert days-since-1970-01-01 into a (year, month, day) civil date.
+/// Howard Hinnant's `civil_from_days` algorithm.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 fn human_size(n: u64) -> String {

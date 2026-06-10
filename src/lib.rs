@@ -8,4 +8,6 @@ pub mod codec;
 #[cfg(feature = "gui")]
 pub mod gui;
 pub mod predictor;
+#[cfg(windows)]
+pub mod shell;
 pub mod transform;

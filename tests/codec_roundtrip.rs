@@ -16,6 +16,21 @@ fn codec_roundtrip_empty() {
 }
 
 #[test]
+fn codec_detects_corruption() {
+    // A flipped payload byte must be caught by the CRC, not silently decoded
+    // into wrong bytes.
+    let data: Vec<u8> = b"the quick brown fox jumps over the lazy dog. "
+        .iter().cycle().take(4000).cloned().collect();
+    let mut compressed = compress(&data, 5).expect("compress failed");
+    let last = compressed.len() - 5;
+    compressed[last] ^= 0xFF;
+    assert!(
+        decompress(&compressed).is_err(),
+        "corrupted archive must fail to decode, not return wrong data"
+    );
+}
+
+#[test]
 fn codec_roundtrip_single_byte() {
     roundtrip(&[0x42]);
 }
@@ -50,18 +65,21 @@ fn codec_roundtrip_random_looking() {
 
 #[test]
 fn codec_header_magic_version() {
-    // "test" = 4 bytes → 1 block
+    // "test" = 4 bytes → 1 block (VERSION 7 header layout)
     let compressed = compress(b"test", 1).unwrap();
     assert_eq!(&compressed[0..4], b"CPGC", "magic bytes wrong");
-    assert_eq!(compressed[4], 4, "version should be 4");
+    assert_eq!(compressed[4], 7, "version should be 7");
     // flags at [5]; orig_len at [6..14]
     let len = u64::from_le_bytes(compressed[6..14].try_into().unwrap());
     assert_eq!(len, 4, "stored length wrong");
-    // n_blocks at [14..18]: 4 bytes → 1 block
-    let n_blocks = u32::from_le_bytes(compressed[14..18].try_into().unwrap());
+    // crc32 at [14..18] must equal CRC-32 of the original bytes
+    let crc = u32::from_le_bytes(compressed[14..18].try_into().unwrap());
+    assert_eq!(crc, crc32fast::hash(b"test"), "stored crc32 wrong");
+    // n_blocks at [18..22]: 4 bytes → 1 block
+    let n_blocks = u32::from_le_bytes(compressed[18..22].try_into().unwrap());
     assert_eq!(n_blocks, 1, "should be 1 block");
-    // block_tag[0] at [18]: level=1 → no transform → 0x00
-    assert_eq!(compressed[18], 0x00, "block tag should be 0x00 (no transform)");
+    // block_tag[0] at [22]: level=1 → no transform → 0x00
+    assert_eq!(compressed[22], 0x00, "block tag should be 0x00 (no transform)");
 }
 
 #[test]
