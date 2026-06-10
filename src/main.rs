@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(name = "cpgc", about = "Contextual Predictive Graph Compression")]
+#[command(name = "cpgc", about = "Contextual Predictive General-purpose Compressor")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -19,6 +19,9 @@ enum Commands {
         input: PathBuf,
         /// Output path (default: <input>.cpgc)
         output: Option<PathBuf>,
+        /// 1-9. Levels 1-3 use the turbo model (several times faster, still
+        /// ahead of xz/brotli on ratio); 4-9 use the full model with
+        /// progressively larger parallel segments.
         #[arg(short, long, default_value_t = 5)]
         level: u8,
     },

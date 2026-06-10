@@ -1,4 +1,4 @@
-//! Bit-level context-mixing predictor for the CPGC-NX engine (v7).
+//! Bit-level context-mixing predictor for the CPGC-NX engine (v8).
 //!
 //! Produces `P(next bit == 1)` as a 12-bit probability. The architecture is a
 //! new *combination* tuned for this codec rather than a port of any single
@@ -32,6 +32,16 @@
 //! * **Chained SSE.** Four adaptive probability maps (keyed by partial byte,
 //!   previous bytes, and an order-3 hash) refine the result before the binary
 //!   arithmetic coder.
+//! * **Two-speed coding.** Bytes deep inside a verified match (>= FAST_LEN)
+//!   are coded by a tiny match-confidence SSE instead of the full model —
+//!   deterministically, since both sides track the match length — making
+//!   redundant regions nearly free in time as well as bits.
+//! * **Runtime-SIMD mixer.** The first-layer dot products and weight updates
+//!   run on AVX2 when available, with a bit-identical scalar fallback, so
+//!   the bitstream never depends on the CPU.
+//! * **Two profiles.** Turbo (levels 1-3) runs a 5-model prefix of the
+//!   roster with two mixer views and two APMs; full runs everything. The
+//!   profile is recorded in the payload header.
 
 use std::sync::OnceLock;
 
@@ -47,6 +57,14 @@ const HBITS_MIN: u32 = 14;
 const MATCH_MIN: usize = 4; // short-hash suffix length that seeds a new match
 const MATCH_MIN_LONG: usize = 8; // long-hash suffix length (tried first)
 const MATCH_EMPTY: u32 = u32::MAX;
+
+// Two-speed coding: once a verified match reaches this length, whole bytes
+// are coded by a tiny adaptive match-confidence model instead of the full
+// 18-model mixer — the byte is almost certainly the match continuation, so
+// the heavy machinery would only sharpen an already near-certain prediction.
+// The switch depends only on match_len, which encoder and decoder track in
+// lockstep, so it is perfectly deterministic.
+const FAST_LEN: u32 = 128;
 
 /// Pick a power-of-two table exponent appropriate for `n` input bytes.
 fn table_bits(n: usize) -> u32 {
@@ -251,6 +269,10 @@ const NSTRIDE: usize = STRIDES.len();
 const NHASH: usize = 8;
 const NSPARSE: usize = 6;
 const NBH: usize = NHASH + NSPARSE + NSTRIDE; // 18 bit-history models
+// The turbo profile (levels 1-3) runs only the first NBH_TURBO models
+// (orders 2-5 + word), two mixer views and two APMs — a several-times-faster
+// engine that still beats the classical tools on ratio.
+const NBH_TURBO: usize = 5;
 
 // First-layer mixer inputs:
 //   order-0 + order-1 dual counters (2 each)
@@ -258,6 +280,9 @@ const NBH: usize = NHASH + NSPARSE + NSTRIDE; // 18 bit-history models
 // + 1 match model
 // + 1 bias
 const NIN: usize = 4 + NBH * 2 + 2;
+// Weight rows are padded to a multiple of 8 lanes for the SIMD mixer; the pad
+// inputs are always zero, so they contribute nothing and learn nothing.
+const NINP: usize = (NIN + 7) & !7;
 const BH_IN: usize = 4; // first bit-history input index
 const MATCH_IN: usize = BH_IN + NBH * 2;
 const BIAS_IN: usize = NIN - 1;
@@ -270,6 +295,9 @@ const NMIX_CTX: usize = 64;
 
 // Mixer learning rate (scales the coding-error gradient applied to weights).
 const MIX_LR: i32 = 5;
+// First-layer weight clamp. ±2^19 at 16 fractional bits (gain ±8) keeps every
+// weight-input product inside i32, which the AVX2 mixer path relies on.
+const W_CLAMP: i32 = (1 << 19) - 1;
 
 // ---------------------------------------------------------------------------
 // Logistic transfer tables (shared, built once).
@@ -412,6 +440,8 @@ pub struct Predictor {
     bh_state: [u8; NBH],         // states read by predict(), for update()
     nib_path: u32,               // nibble-local path register (1..15)
     pending_hs: [u32; NBH],      // low-nibble hashes, prefetched a bit early
+    nbh: usize,                  // active model count (NBH_TURBO or NBH)
+    turbo: bool,                 // reduced mixer/SSE roster for low levels
 
     // Partial byte: starts at 1, accumulates coded bits.
     c0: u32,
@@ -426,12 +456,22 @@ pub struct Predictor {
     match_len: u32,
     match_byte: i32, // predicted next byte, or -1 if no active match
 
+    // Two-speed coding state. fast_mode is fixed per byte (at next_byte);
+    // fast_p is a tiny SSE keyed by (match-length bucket, bit position,
+    // predicted bit); fast_state remembers which sub-model predicted the
+    // current bit (1 = match SSE, 2 = order-0/1 fallback after a break).
+    fast_mode: bool,
+    fast_state: u8,
+    fast_idx: usize,
+    fast_p: [u16; 256],
+
     // First-layer mixer: four context-selected weight sets.
-    wa: Vec<i32>, // [256][NIN] selected by previous byte
-    wb: Vec<i32>, // [64][NIN]  selected by match-length bucket
-    wc: Vec<i32>, // [256][NIN] selected by the byte before previous
-    wd: Vec<i32>, // [256][NIN] selected by the partial byte (c0)
-    tx: [i32; NIN],
+    wa: Vec<i32>, // [256][NINP] selected by previous byte
+    wb: Vec<i32>, // [64][NINP]  selected by match-length bucket
+    wc: Vec<i32>, // [256][NINP] selected by the byte before previous
+    wd: Vec<i32>, // [256][NINP] selected by the partial byte (c0)
+    tx: [i32; NINP],
+    use_avx2: bool, // AVX2 detected at runtime (paths are bit-identical)
     ctx_a: usize,
     ctx_b: usize,
     ctx_c: usize,
@@ -452,10 +492,14 @@ pub struct Predictor {
 }
 
 impl Predictor {
-    pub fn new(n: usize) -> Self {
+    /// `turbo` selects the reduced low-level profile. It changes the
+    /// bitstream, so the codec records it in the payload header.
+    pub fn new(n: usize, turbo: bool) -> Self {
         let _ = squash(0);
         let _ = stretch(2048);
         let _ = st_direct_tbl();
+
+        let nbh = if turbo { NBH_TURBO } else { NBH };
 
         // Bucket counts: states are 1 byte (16-byte buckets serve a whole
         // nibble), so the tables are far smaller than v6's 6-byte-slot tables
@@ -469,12 +513,19 @@ impl Predictor {
         let msize = 1usize << mbits;
 
         // Initialise the second-layer weights so the mixer starts out close to
-        // an average of its four inputs; gradient descent refines from there.
-        let avg_w = ((1i64 << 16) / (NMIX as i64 - 1)) as i32;
+        // an average of its active view inputs (two in turbo, four in full);
+        // gradient descent refines from there.
+        let views = if turbo { 2 } else { 4 };
+        let avg_w = ((1i64 << 16) / views) as i32;
         let mut wf = vec![0i32; NMIX_CTX * NMIX];
         for c in 0..NMIX_CTX {
-            for i in 0..NMIX - 1 {
-                wf[c * NMIX + i] = avg_w;
+            if turbo {
+                wf[c * NMIX] = avg_w; // sa
+                wf[c * NMIX + 3] = avg_w; // sd
+            } else {
+                for i in 0..NMIX - 1 {
+                    wf[c * NMIX + i] = avg_w;
+                }
             }
             // the bias weight (last slot) stays 0
         }
@@ -487,10 +538,12 @@ impl Predictor {
             hist: [0; 8],
             word_hash: 0,
             last_word: 0,
-            bh: (0..NBH)
+            bh: (0..nbh)
                 .map(|k| BhTable::new(if k < NHASH { bh_bits } else { stride_bits }))
                 .collect(),
-            bh_sm: vec![sm_init(); NBH],
+            bh_sm: vec![sm_init(); nbh],
+            nbh,
+            turbo,
             bh_base: [0; NBH],
             bh_off: [1; NBH],
             bh_state: [0; NBH],
@@ -504,11 +557,29 @@ impl Predictor {
             match_ptr: 0,
             match_len: 0,
             match_byte: -1,
-            wa: vec![0i32; 256 * NIN],
-            wb: vec![0i32; 64 * NIN],
-            wc: vec![0i32; 256 * NIN],
-            wd: vec![0i32; 256 * NIN],
-            tx: [0; NIN],
+            fast_mode: false,
+            fast_state: 0,
+            fast_idx: 0,
+            fast_p: {
+                // Seed: when the match predicts 1 expect ~0.95, else ~0.05;
+                // the per-bucket entries adapt from there.
+                let mut t = [0u16; 256];
+                let mut i = 0;
+                while i < 256 {
+                    t[i] = if i & 1 == 1 { 3900 << 4 } else { 196 << 4 };
+                    i += 1;
+                }
+                t
+            },
+            wa: vec![0i32; 256 * NINP],
+            wb: vec![0i32; 64 * NINP],
+            wc: vec![0i32; 256 * NINP],
+            wd: vec![0i32; 256 * NINP],
+            tx: [0; NINP],
+            #[cfg(target_arch = "x86_64")]
+            use_avx2: std::arch::is_x86_feature_detected!("avx2"),
+            #[cfg(not(target_arch = "x86_64"))]
+            use_avx2: false,
             ctx_a: 0,
             ctx_b: 0,
             ctx_c: 0,
@@ -525,16 +596,12 @@ impl Predictor {
         }
     }
 
-    /// Locate every model's bucket for the nibble that starts now. `nib0` is
-    /// `None` for the high nibble, or the four already-coded high bits for the
-    /// low nibble. All candidate cache lines are prefetched before the find()
-    /// pass so the (usually missing) loads overlap.
     /// Hashes for the low nibble's buckets, given the four high bits.
     #[inline]
     fn nib1_hashes(&self, nib0: u32) -> [u32; NBH] {
         let salt = (nib0 + 17).wrapping_mul(PR2);
         let mut hs = [0u32; NBH];
-        for k in 0..NBH {
+        for k in 0..self.nbh {
             let mut h = self.bh_base[k] ^ salt;
             h ^= h >> 15;
             hs[k] = h;
@@ -549,14 +616,45 @@ impl Predictor {
     /// that are already in flight.
     #[inline]
     fn resolve_buckets(&mut self, hs: &[u32; NBH]) {
-        for k in 0..NBH {
+        for k in 0..self.nbh {
             self.bh_off[k] = self.bh[k].find(hs[k]);
         }
         self.nib_path = 1;
     }
 
+    /// Fast-path prediction inside a long verified match: a 256-entry SSE
+    /// keyed by (match-length bucket, bit position, predicted bit), with an
+    /// order-0/1 fallback if the match is contradicted mid-byte.
+    #[inline]
+    fn fast_predict(&mut self) -> i32 {
+        let c0 = self.c0;
+        let bits_seen = 31 - c0.leading_zeros(); // 0..7
+        let mp = self.match_byte as u32; // fast_mode guarantees match_byte >= 0
+        let coded = c0 - (1 << bits_seen);
+        if coded == mp >> (8 - bits_seen) {
+            let predicted_bit = ((mp >> (7 - bits_seen)) & 1) as usize;
+            let bucket = (31 - self.match_len.leading_zeros()).min(15) as usize;
+            let idx = (bucket << 4) | ((bits_seen as usize) << 1) | predicted_bit;
+            self.fast_idx = idx;
+            self.fast_state = 1;
+            self.final_pr = ((self.fast_p[idx] >> 4) as i32).clamp(1, 4095);
+        } else {
+            // Match broke mid-byte: finish the byte on the order-0/1 counters.
+            self.idx0 = c0 as usize;
+            self.idx1 = ((self.hist[0] as usize) << 8) | (c0 as usize & 0xff);
+            let p0 = self.t0[self.idx0].slow as i32;
+            let p1 = self.t1[self.idx1].slow as i32;
+            self.fast_state = 2;
+            self.final_pr = (((p1 * 3 + p0) >> 2) >> 4).clamp(1, 4095);
+        }
+        self.final_pr
+    }
+
     #[inline]
     pub fn predict(&mut self) -> i32 {
+        if self.fast_mode {
+            return self.fast_predict();
+        }
         let c0 = self.c0;
 
         // Nibble boundary: re-anchor every bit-history model.
@@ -582,7 +680,7 @@ impl Predictor {
         // --- bit-history models: state map + direct state estimate -------
         let sidx = (self.nib_path - 1) as usize;
         let st_direct = st_direct_tbl();
-        for k in 0..NBH {
+        for k in 0..self.nbh {
             let s = self.bh[k].t[self.bh_off[k] + sidx];
             self.bh_state[k] = s;
             let e = self.bh_sm[k][s as usize];
@@ -596,15 +694,22 @@ impl Predictor {
         // --- bias --------------------------------------------------------
         self.tx[BIAS_IN] = 256;
 
-        // --- first-layer mixing: four context-selected weight sets -------
+        // --- first-layer mixing: context-selected weight sets -------------
+        // (turbo runs only the prev-byte and partial-byte views)
         self.ctx_a = self.hist[0] as usize;
         self.ctx_b = (self.match_len.min(63)) as usize;
         self.ctx_c = self.hist[1] as usize;
         self.ctx_d = (c0 & 0xff) as usize;
         let sa = self.dot(&self.wa, self.ctx_a);
-        let sb = sa;
-        let sc = sa;
-        let sd = sa;
+        let sd = self.dot(&self.wd, self.ctx_d);
+        let (sb, sc) = if self.turbo {
+            (0, 0)
+        } else {
+            (
+                self.dot(&self.wb, self.ctx_b),
+                self.dot(&self.wc, self.ctx_c),
+            )
+        };
 
         // --- second-layer mixing: a small learned combiner ---------------
         self.mi = [sa, sb, sc, sd, 256];
@@ -613,27 +718,33 @@ impl Predictor {
         let mixed = self.dot2(self.ctx_f);
         self.pr = squash(mixed);
 
-        // --- SSE refinement ---------------------------------------------
+        // --- SSE refinement (turbo keeps apm0 + apm2 only) ----------------
         let p0 = self.apm0.refine(self.pr, self.ctx_d);
         let mut p = (self.pr + p0 * 3) >> 2;
-        let p1 = self.apm1.refine(p, self.ctx_a);
-        p = (p + p1 * 3) >> 2;
+        if !self.turbo {
+            let p1 = self.apm1.refine(p, self.ctx_a);
+            p = (p + p1 * 3) >> 2;
+        }
         let p2 = self.apm2.refine(p, (self.bh_base[1] & 0x3ff) as usize);
         p = (p + p2 * 3) >> 2;
-        let p3 = self.apm3.refine(p, self.ctx_c);
-        p = (p + p3 * 3) >> 2;
+        if !self.turbo {
+            let p3 = self.apm3.refine(p, self.ctx_c);
+            p = (p + p3 * 3) >> 2;
+        }
         self.final_pr = p.clamp(1, 4095);
         self.final_pr
     }
 
     #[inline]
     fn dot(&self, w: &[i32], ctx: usize) -> i32 {
-        let base = ctx * NIN;
-        let mut acc = 0i64;
-        for i in 0..NIN {
-            acc += (w[base + i] as i64) * (self.tx[i] as i64);
+        let base = ctx * NINP;
+        let row = &w[base..base + NINP];
+        #[cfg(target_arch = "x86_64")]
+        if self.use_avx2 {
+            // SAFETY: only taken when AVX2 was detected at runtime.
+            return unsafe { dot_avx2(row, &self.tx) };
         }
-        (acc >> 16) as i32
+        dot_scalar(row, &self.tx)
     }
 
     #[inline]
@@ -671,13 +782,29 @@ impl Predictor {
 
     #[inline]
     pub fn update(&mut self, bit: i32) {
+        if self.fast_mode {
+            match self.fast_state {
+                1 => {
+                    // Adapt the match-confidence entry that was used.
+                    let target = (bit << 16) as i32;
+                    let v = self.fast_p[self.fast_idx] as i32;
+                    self.fast_p[self.fast_idx] = (v + ((target - v) >> 5)) as u16;
+                }
+                _ => {
+                    self.t0[self.idx0].update(bit);
+                    self.t1[self.idx1].update(bit);
+                }
+            }
+            self.c0 = (self.c0 << 1) | (bit as u32);
+            return;
+        }
         self.t0[self.idx0].update(bit);
         self.t1[self.idx1].update(bit);
 
         // Bit-history models: adapt the state-map entry that was used, then
         // advance the node's state by the observed bit.
         let sidx = (self.nib_path - 1) as usize;
-        for k in 0..NBH {
+        for k in 0..self.nbh {
             let s = self.bh_state[k];
             self.bh_sm[k][s as usize].update(bit);
             self.bh[k].t[self.bh_off[k] + sidx] = state_next(s, bit);
@@ -686,12 +813,15 @@ impl Predictor {
 
         // First-layer weights: gradient step on coding error for all views.
         let err = ((bit << 12) - self.pr) * MIX_LR;
-        Self::train(&mut self.wa, self.ctx_a, &self.tx, err);
-        
-        
-        
+        let avx2 = self.use_avx2;
+        Self::train(&mut self.wa, self.ctx_a, &self.tx, err, avx2);
+        if !self.turbo {
+            Self::train(&mut self.wb, self.ctx_b, &self.tx, err, avx2);
+            Self::train(&mut self.wc, self.ctx_c, &self.tx, err, avx2);
+        }
+        Self::train(&mut self.wd, self.ctx_d, &self.tx, err, avx2);
 
-        // Second-layer weights: same error, over the four first-layer outputs.
+        // Second-layer weights: same error, over the first-layer outputs.
         let base = self.ctx_f * NMIX;
         for i in 0..NMIX {
             let nw = self.wf[base + i] + (((self.mi[i] * err) + 0x8000) >> 16);
@@ -699,9 +829,11 @@ impl Predictor {
         }
 
         self.apm0.update(bit);
-        self.apm1.update(bit);
         self.apm2.update(bit);
-        self.apm3.update(bit);
+        if !self.turbo {
+            self.apm1.update(bit);
+            self.apm3.update(bit);
+        }
 
         self.c0 = (self.c0 << 1) | (bit as u32);
 
@@ -711,7 +843,7 @@ impl Predictor {
         // APM updates — that slack hides most of the memory latency.
         if self.c0 >> 4 == 1 {
             let hs = self.nib1_hashes(self.c0 & 15);
-            for k in 0..NBH {
+            for k in 0..self.nbh {
                 self.bh[k].prefetch(hs[k]);
             }
             self.pending_hs = hs;
@@ -719,12 +851,18 @@ impl Predictor {
     }
 
     #[inline]
-    fn train(w: &mut [i32], ctx: usize, tx: &[i32; NIN], err: i32) {
-        let base = ctx * NIN;
-        for i in 0..NIN {
-            let nw = w[base + i] + (((tx[i] * err) + 0x8000) >> 16);
-            w[base + i] = nw.clamp(-(1 << 20), 1 << 20);
+    fn train(w: &mut [i32], ctx: usize, tx: &[i32; NINP], err: i32, use_avx2: bool) {
+        let base = ctx * NINP;
+        let row = &mut w[base..base + NINP];
+        #[cfg(target_arch = "x86_64")]
+        if use_avx2 {
+            // SAFETY: only taken when AVX2 was detected at runtime.
+            unsafe { train_avx2(row, tx, err) };
+            return;
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = use_avx2;
+        train_scalar(row, tx, err);
     }
 
     /// Commit a finished byte: update history, the match model, and rebuild
@@ -785,6 +923,11 @@ impl Predictor {
             -1
         };
 
+        // Two-speed switch for the upcoming byte: deep inside a verified
+        // match, code it on the fast path. Both sides compute this from the
+        // same decoded history, so the choice never needs to be signalled.
+        self.fast_mode = self.match_len >= FAST_LEN && self.match_byte >= 0;
+
         // --- context history --------------------------------------------
         self.hist.copy_within(0..7, 1);
         self.hist[0] = byte;
@@ -803,46 +946,52 @@ impl Predictor {
             self.word_hash = 0;
         }
 
+        // The first NBH_TURBO models are the turbo profile's entire roster,
+        // so the reduced profile is simply a prefix of the full one.
         self.bh_base[0] = hash_ctx(&self.hist[0..2], 2); // order-2
         self.bh_base[1] = hash_ctx(&self.hist[0..3], 3); // order-3
         self.bh_base[2] = hash_ctx(&self.hist[0..4], 4); // order-4
         self.bh_base[3] = hash_ctx(&self.hist[0..5], 5); // order-5
-        self.bh_base[4] = hash_ctx(&self.hist[0..6], 6); // order-6
-        self.bh_base[5] = hash_ctx(&self.hist[0..7], 7); // order-7
-        self.bh_base[6] = self.word_hash.wrapping_mul(PR1) ^ 0xABCD_1234; // word
-        // Word-pair: previous finished word + current word prefix. Models
-        // bigram structure in natural-language text ("of the", "in a", ...).
-        self.bh_base[7] = self
-            .last_word
-            .wrapping_mul(PR2)
-            .wrapping_add(self.word_hash)
-            .wrapping_mul(PR1)
-            ^ 0x5A5A_C3C3;
-        // Sparse contexts: a skip-gram that ignores the immediately previous
-        // byte, and the high nibbles of the last two bytes — both useful on
-        // structured binary where the low bits are noise.
-        self.bh_base[8] = hash_ctx(&self.hist[1..2], 23);
-        self.bh_base[9] = hash_ctx(&[self.hist[0] & 0xF0, self.hist[1] & 0xF0], 29);
-        self.bh_base[10] = hash_ctx(&[self.hist[0], self.hist[2]], 31);
-        self.bh_base[11] = hash_ctx(&[self.hist[1], self.hist[2]], 37);
-        self.bh_base[12] = hash_ctx(&[self.hist[0], self.hist[3]], 41);
-        self.bh_base[13] = hash_ctx(&self.hist[2..4], 43);
+        self.bh_base[4] = self.word_hash.wrapping_mul(PR1) ^ 0xABCD_1234; // word
+        if self.nbh > NBH_TURBO {
+            self.bh_base[5] = hash_ctx(&self.hist[0..6], 6); // order-6
+            self.bh_base[6] = hash_ctx(&self.hist[0..7], 7); // order-7
+            // Word-pair: previous finished word + current word prefix. Models
+            // bigram structure in natural-language text ("of the", "in a").
+            self.bh_base[7] = self
+                .last_word
+                .wrapping_mul(PR2)
+                .wrapping_add(self.word_hash)
+                .wrapping_mul(PR1)
+                ^ 0x5A5A_C3C3;
+            // Sparse contexts: skip-grams and high-nibble views — useful on
+            // structured binary where the low bits are noise.
+            self.bh_base[8] = hash_ctx(&self.hist[1..2], 23);
+            self.bh_base[9] = hash_ctx(&[self.hist[0] & 0xF0, self.hist[1] & 0xF0], 29);
+            self.bh_base[10] = hash_ctx(&[self.hist[0], self.hist[2]], 31);
+            self.bh_base[11] = hash_ctx(&[self.hist[1], self.hist[2]], 37);
+            self.bh_base[12] = hash_ctx(&[self.hist[0], self.hist[3]], 41);
+            self.bh_base[13] = hash_ctx(&self.hist[2..4], 43);
 
-        // Stride bases: predict the upcoming byte (at index buf.len()) from the
-        // same lane of the previous one/two samples `stride` bytes back.
-        let n = self.buf.len();
-        for (k, &s) in STRIDES.iter().enumerate() {
-            let b1 = if n >= s { self.buf[n - s] as u32 } else { 0 };
-            let b2 = if n >= 2 * s { self.buf[n - 2 * s] as u32 } else { 0 };
-            let mut h = (s as u32).wrapping_mul(PR1).wrapping_add(0x55AA_33CC);
-            h = (h ^ (b1 + 1)).wrapping_mul(PR1);
-            h = (h ^ (b2 + 1)).wrapping_mul(PR1);
-            self.bh_base[NHASH + NSPARSE + k] = h ^ (h >> 15);
+            // Stride bases: predict the upcoming byte (at index buf.len())
+            // from the same lane of previous samples `stride` bytes back.
+            let n = self.buf.len();
+            for (k, &s) in STRIDES.iter().enumerate() {
+                let b1 = if n >= s { self.buf[n - s] as u32 } else { 0 };
+                let b2 = if n >= 2 * s { self.buf[n - 2 * s] as u32 } else { 0 };
+                let mut h = (s as u32).wrapping_mul(PR1).wrapping_add(0x55AA_33CC);
+                h = (h ^ (b1 + 1)).wrapping_mul(PR1);
+                h = (h ^ (b2 + 1)).wrapping_mul(PR1);
+                self.bh_base[NHASH + NSPARSE + k] = h ^ (h >> 15);
+            }
         }
 
-        // High-nibble bucket addresses are now known; start their lines early.
-        for k in 0..NBH {
-            self.bh[k].prefetch(self.bh_base[k]);
+        // High-nibble bucket addresses are now known; start their lines early
+        // (pointless when the next byte takes the fast path).
+        if !self.fast_mode {
+            for k in 0..self.nbh {
+                self.bh[k].prefetch(self.bh_base[k]);
+            }
         }
     }
 
@@ -860,6 +1009,74 @@ impl Predictor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Mixer kernels. The AVX2 versions are bit-identical to the scalar ones:
+// every weight-input product fits i32 exactly (|w| <= W_CLAMP < 2^19,
+// |tx| <= 2047), the dot sums are widened to i64 (associative, no overflow),
+// and srai/min/max match Rust's >> and clamp. An archive encoded on an AVX2
+// machine therefore decodes identically on a non-AVX2 one and vice versa.
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn dot_scalar(row: &[i32], tx: &[i32; NINP]) -> i32 {
+    let mut acc = 0i64;
+    for i in 0..NINP {
+        acc += (row[i] as i64) * (tx[i] as i64);
+    }
+    (acc >> 16) as i32
+}
+
+#[inline]
+fn train_scalar(row: &mut [i32], tx: &[i32; NINP], err: i32) {
+    for i in 0..NINP {
+        let nw = row[i] + (((tx[i] * err) + 0x8000) >> 16);
+        row[i] = nw.clamp(-W_CLAMP, W_CLAMP);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_avx2(row: &[i32], tx: &[i32; NINP]) -> i32 {
+    use std::arch::x86_64::*;
+    debug_assert!(row.len() >= NINP);
+    let mut acc = _mm256_setzero_si256(); // 4 x i64 partial sums
+    let mut i = 0;
+    while i < NINP {
+        let w = _mm256_loadu_si256(row.as_ptr().add(i) as *const __m256i);
+        let x = _mm256_loadu_si256(tx.as_ptr().add(i) as *const __m256i);
+        let p = _mm256_mullo_epi32(w, x); // exact: |w * x| < 2^30
+        let lo = _mm256_cvtepi32_epi64(_mm256_castsi256_si128(p));
+        let hi = _mm256_cvtepi32_epi64(_mm256_extracti128_si256::<1>(p));
+        acc = _mm256_add_epi64(acc, _mm256_add_epi64(lo, hi));
+        i += 8;
+    }
+    let mut lanes = [0i64; 4];
+    _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, acc);
+    ((lanes[0] + lanes[1] + lanes[2] + lanes[3]) >> 16) as i32
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn train_avx2(row: &mut [i32], tx: &[i32; NINP], err: i32) {
+    use std::arch::x86_64::*;
+    debug_assert!(row.len() >= NINP);
+    let verr = _mm256_set1_epi32(err);
+    let vround = _mm256_set1_epi32(0x8000);
+    let vmax = _mm256_set1_epi32(W_CLAMP);
+    let vmin = _mm256_set1_epi32(-W_CLAMP);
+    let mut i = 0;
+    while i < NINP {
+        let x = _mm256_loadu_si256(tx.as_ptr().add(i) as *const __m256i);
+        let p = _mm256_mullo_epi32(x, verr); // exact: |tx * err| < 2^26
+        let d = _mm256_srai_epi32::<16>(_mm256_add_epi32(p, vround));
+        let w = _mm256_loadu_si256(row.as_ptr().add(i) as *const __m256i);
+        let nw = _mm256_add_epi32(w, d);
+        let cl = _mm256_max_epi32(vmin, _mm256_min_epi32(vmax, nw));
+        _mm256_storeu_si256(row.as_mut_ptr().add(i) as *mut __m256i, cl);
+        i += 8;
+    }
+}
+
 /// Hash a context byte slice with an order-specific salt.
 #[inline]
 fn hash_ctx(bytes: &[u8], salt: u32) -> u32 {
@@ -869,4 +1086,44 @@ fn hash_ctx(bytes: &[u8], salt: u32) -> u32 {
         h ^= h >> 15;
     }
     h
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The AVX2 mixer kernels must match the scalar ones bit-for-bit, or
+    /// archives would not decode across machines with different CPUs.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn simd_kernels_match_scalar() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return; // nothing to compare on this machine
+        }
+        let mut x: u64 = 0x1234_5678_9abc_def0;
+        let mut rnd = move |m: i32| {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((x >> 33) as i32 % (2 * m + 1)) - m
+        };
+        for _ in 0..200 {
+            let mut tx = [0i32; NINP];
+            let mut row_a = vec![0i32; NINP];
+            for i in 0..NINP {
+                tx[i] = rnd(2047);
+                row_a[i] = rnd(W_CLAMP);
+            }
+            let mut row_b = row_a.clone();
+            let err = rnd(4095 * MIX_LR);
+
+            let d_scalar = dot_scalar(&row_a, &tx);
+            let d_avx2 = unsafe { dot_avx2(&row_a, &tx) };
+            assert_eq!(d_scalar, d_avx2, "dot kernels diverged");
+
+            train_scalar(&mut row_a, &tx, err);
+            unsafe { train_avx2(&mut row_b, &tx, err) };
+            assert_eq!(row_a, row_b, "train kernels diverged");
+        }
+    }
 }

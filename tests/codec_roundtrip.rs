@@ -65,10 +65,10 @@ fn codec_roundtrip_random_looking() {
 
 #[test]
 fn codec_header_magic_version() {
-    // "test" = 4 bytes → 1 block (VERSION 7 header layout)
+    // "test" = 4 bytes → 1 block (VERSION 8 header layout)
     let compressed = compress(b"test", 1).unwrap();
     assert_eq!(&compressed[0..4], b"CPGC", "magic bytes wrong");
-    assert_eq!(compressed[4], 7, "version should be 7");
+    assert_eq!(compressed[4], 8, "version should be 8");
     // flags at [5]; orig_len at [6..14]
     let len = u64::from_le_bytes(compressed[6..14].try_into().unwrap());
     assert_eq!(len, 4, "stored length wrong");

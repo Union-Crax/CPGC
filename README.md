@@ -1,7 +1,13 @@
-# CPGC — Contextual Predictive Graph Compression
+# CPGC — Contextual Predictive General-purpose Compressor
 
 A general-purpose compressor built on **CPGC-NX**, a bit-level context-mixing
 predictor feeding a binary arithmetic coder.
+
+> *Naming note:* CPGC originally stood for "Contextual Predictive **Graph**
+> Compression" — a relic of the first LSTM/graph prototype. The engine has
+> been a context-mixing predictor for a long time now, so the G has been
+> re-pointed at what the tool actually is. The acronym, the CLI name and the
+> `CPGC` magic bytes are unchanged.
 
 **Status: on general text it beats gzip, bzip2 and xz/LZMA on ratio.** It does
 not beat the heaviest research compressors (cmix/PAQ8), and on tiny files or
@@ -59,6 +65,19 @@ shared with the PAQ family, but the model below is specific to this codec):
   trained online by gradient descent on coding loss — strictly more general
   than averaging the views.
 - **Chained SSE** — four adaptive probability maps refine the mixed estimate.
+- **Two-speed coding** — once a verified match is 128+ bytes deep, whole
+  bytes are coded by a tiny adaptive match-confidence model instead of the
+  full mixer. The switch depends only on the match length, which encoder and
+  decoder track in lockstep, so it costs zero signalling bits. Redundant
+  regions fly through at a fraction of the cost — and slightly *better*
+  ratio, because the dedicated model is sharper there than the full mix.
+- **Runtime-SIMD mixer** — the mixer (half the per-bit work) uses an AVX2
+  path when the CPU has it, with a scalar fallback that is bit-identical
+  (every product fits i32 exactly; sums widen to i64), so archives decode
+  across machines regardless of CPU features. No compile flags needed.
+- **Two model profiles** — levels 1–3 run a turbo roster (orders 2–5 + word,
+  two mixer views, two APMs) recorded as a byte in the payload; levels 4–9
+  run everything. Turbo is ~2.2x faster and still beats the classical tools.
 
 Every archive stores a **CRC-32 of the original bytes**, verified after
 decoding: a corrupt archive — or one written by an incompatible model version —
@@ -83,27 +102,34 @@ with cores — so on big archives CPGC-NX is not only smaller than xz but
 
 ## Measured results
 
-> **Note:** the reference table below predates the current (v7) engine. The
+> **Note:** the reference table below predates the current (v8) engine. The
 > lineage: v5 added count-adaptive counters, orders 0–7 and a two-layer
 > learned mixer; v6 added indirect bit-history models, a word-pair context, a
 > dual match model and a partial-byte mixer view + APM; v7 rebuilt the entire
-> model state around nibble-bucketed, checksummed bit-history states — which
-> made it **both ~5% smaller and ~2.4x faster than v6 at once** (memory
-> traffic, not arithmetic, was the bottleneck). The figures below are
+> model state around nibble-bucketed, checksummed bit-history states (~5%
+> smaller *and* ~2.4x faster than v6 at once); v8 added a runtime-detected
+> AVX2 mixer (bit-exact with the scalar path), **two-speed coding** (long
+> verified matches are coded by a tiny match-confidence model, skipping the
+> whole mixer), and a **turbo profile** at levels 1–3. The figures below are
 > therefore conservative.
 >
-> Fresh v7 measurements on the current `corpus/` files (level 9, verified
-> round-trips), against every big-name tool at its maximum setting:
+> Fresh v8 measurements on the current `corpus/` files (verified round-trips),
+> against every big-name tool at its maximum setting. Sizes in bytes, times
+> are single-segment compress times on one core:
 >
-> | file | orig | **CPGC-NX v7** | v6 | xz -9e | brotli -q11 | bzip2 -9 |
+> | file | orig | **v8 -9** | **v8 -3 (turbo)** | xz -9e | brotli -q11 | bzip2 -9 |
 > |---|--:|--:|--:|--:|--:|--:|
-> | code.txt (source) | 262,949 | **46,918** | 48,539 | 57,936 | 56,005 | 57,808 |
-> | english.txt (prose) | 738,046 | **162,092** | 163,168 | 216,120 | 212,481 | 186,325 |
-> | exe.bin (executable) | 1,148,450 | **320,997** | 346,265 | 393,420 | 399,862 | 458,841 |
+> | code.txt | 262,949 | **46,920** (0.6 s) | 48,654 (0.3 s) | 57,936 | 56,005 | 57,808 |
+> | english.txt | 738,046 | **162,093** (1.7 s) | 166,103 (0.8 s) | 216,120 | 212,481 | 186,325 |
+> | exe.bin | 1,148,450 | **321,033** (2.8 s) | 369,261 (1.2 s) | 393,420 | 399,862 | 458,841 |
 >
-> v7 wins every row — 13–18% smaller than the best big-name runner-up — while
-> single-segment throughput roughly **2.4x'd** over v6 (exe.bin: 8.8 s → 3.5 s
-> to compress, 8.4 s → 3.4 s to decompress).
+> Level 9 wins every row by 13–18% over the best big-name runner-up — at
+> **3x the speed of two versions ago** (exe.bin compress: v6 8.8 s → v8
+> 2.8 s). Even the turbo profile, another 2.1–2.4x faster, still beats xz,
+> brotli and bzip2 on all three files. On highly redundant data the
+> two-speed fast path pays off hardest: a 12x-repeated source file
+> compresses **2.4x faster *and* slightly smaller** than with the full
+> model engaged throughout.
 
 Compressed size in bytes (smaller is better), with verified lossless
 round-trips. Reference tools at maximum setting (`-9`).
@@ -133,9 +159,9 @@ through, so there is no expansion blow-up.
   times) xz's 64 MB LZ window wins, because such repeats can straddle the
   segment boundaries CPGC compresses independently. Real archives rarely look
   like this; on varied data segmentation costs almost nothing.
-- Single-segment throughput is ~0.3 MB/s with the full v7 model (the cost of
-  per-bit mixing over 18 models); parallelism across segments is what lifts
-  large-archive throughput past xz.
+- Single-segment throughput is ~0.4 MB/s with the full v8 model on an AVX2
+  machine (~1 MB/s in turbo, more when data is redundant); parallelism across
+  segments multiplies that by the core count on large archives.
 
 The previous online-LSTM engine (which topped out around 2.95 bpb at ~0.4 MB/s)
 still lives in `src/predictor/` and `src/ans/` for reference, but is no longer

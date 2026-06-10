@@ -21,6 +21,12 @@
 //!    small second-layer combiner trained online on coding loss.
 //! 5. **A chained SSE stage** (four APMs) refines the result before the
 //!    binary arithmetic coder.
+//! 6. **Two-speed coding** — bytes deep inside a verified match are coded by
+//!    a tiny match-confidence model, skipping the mixer entirely; the switch
+//!    is deterministic so it costs no signalling.
+//! 7. **A runtime-SIMD mixer** (AVX2 with a bit-identical scalar fallback)
+//!    and **two model profiles** (turbo for levels 1-3, full for 4-9; the
+//!    profile byte travels in the payload header).
 //!
 //! ## Scaling to big archives
 //!
@@ -72,22 +78,25 @@ pub fn seg_size_for_level(level: u8) -> usize {
 
 /// Compress `data` into a self-contained CPGC-NX payload at the given level.
 ///
-/// The payload is self-framing — it records the segment size and each
-/// segment's compressed length — but carries no *total* length prefix; the
-/// caller is expected to know how many bytes to decode (CPGC stores `orig_len`
-/// in its container header).
+/// The payload is self-framing — it records the segment size, the model
+/// profile and each segment's compressed length — but carries no *total*
+/// length prefix; the caller is expected to know how many bytes to decode
+/// (CPGC stores `orig_len` in its container header).
 ///
 /// Layout:
 /// ```text
 /// [0..4]   seg_size: u32 LE   (bytes of original data per segment)
 /// [4..8]   n_seg: u32 LE
-/// [8..]    n_seg × (comp_len: u32 LE)
+/// [8]      profile: u8        (0 = full model, 1 = turbo)
+/// [9..]    n_seg × (comp_len: u32 LE)
 /// [rest]   segment payloads, concatenated in order
 /// ```
 /// Segment `i` decompresses to `data[i*seg_size .. min((i+1)*seg_size, n)]`, so
-/// only the *compressed* lengths need to be stored.
+/// only the *compressed* lengths need to be stored. Levels 1-3 use the turbo
+/// profile (a reduced model roster, several times faster); the profile byte
+/// means decoding never depends on the level mapping.
 pub fn encode(data: &[u8], level: u8) -> Vec<u8> {
-    encode_framed(data, seg_size_for_level(level))
+    encode_framed(data, seg_size_for_level(level), level <= 3)
 }
 
 /// Decode exactly `n` bytes from a payload produced by [`encode`].
@@ -95,7 +104,7 @@ pub fn decode(payload: &[u8], n: usize) -> Vec<u8> {
     decode_framed(payload, n)
 }
 
-fn encode_framed(data: &[u8], seg_size: usize) -> Vec<u8> {
+fn encode_framed(data: &[u8], seg_size: usize, turbo: bool) -> Vec<u8> {
     if data.is_empty() {
         return Vec::new();
     }
@@ -104,15 +113,16 @@ fn encode_framed(data: &[u8], seg_size: usize) -> Vec<u8> {
     // Compress each segment independently, in parallel.
     let segments: Vec<Vec<u8>> = data
         .par_chunks(seg_size)
-        .map(encode_segment)
+        .map(|chunk| encode_segment(chunk, turbo))
         .collect();
 
     let n_seg = segments.len();
-    let header = 8 + 4 * n_seg;
+    let header = 9 + 4 * n_seg;
     let body: usize = segments.iter().map(|s| s.len()).sum();
     let mut out = Vec::with_capacity(header + body);
     out.extend_from_slice(&(seg_size as u32).to_le_bytes());
     out.extend_from_slice(&(n_seg as u32).to_le_bytes());
+    out.push(turbo as u8);
     for s in &segments {
         out.extend_from_slice(&(s.len() as u32).to_le_bytes());
     }
@@ -123,20 +133,21 @@ fn encode_framed(data: &[u8], seg_size: usize) -> Vec<u8> {
 }
 
 fn decode_framed(payload: &[u8], n: usize) -> Vec<u8> {
-    if n == 0 || payload.len() < 8 {
+    if n == 0 || payload.len() < 9 {
         return Vec::new();
     }
     let seg_size = (u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize).max(1);
     let n_seg = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
+    let turbo = payload[8] != 0;
     let comp_lens: Vec<usize> = (0..n_seg)
         .map(|i| {
-            let o = 8 + 4 * i;
+            let o = 9 + 4 * i;
             u32::from_le_bytes(payload[o..o + 4].try_into().unwrap()) as usize
         })
         .collect();
 
     // Slice the concatenated payloads and pair each with its decoded length.
-    let mut body = &payload[8 + 4 * n_seg..];
+    let mut body = &payload[9 + 4 * n_seg..];
     let mut jobs: Vec<(&[u8], usize)> = Vec::with_capacity(n_seg);
     for (i, &clen) in comp_lens.iter().enumerate() {
         let seg_start = i * seg_size;
@@ -149,7 +160,7 @@ fn decode_framed(payload: &[u8], n: usize) -> Vec<u8> {
     // Decode segments in parallel, then concatenate in order.
     let parts: Vec<Vec<u8>> = jobs
         .par_iter()
-        .map(|&(p, len)| decode_segment(p, len))
+        .map(|&(p, len)| decode_segment(p, len, turbo))
         .collect();
 
     let mut out = Vec::with_capacity(n);
@@ -160,8 +171,8 @@ fn decode_framed(payload: &[u8], n: usize) -> Vec<u8> {
 }
 
 /// Compress a single segment (no framing).
-fn encode_segment(data: &[u8]) -> Vec<u8> {
-    let mut model = Predictor::new(data.len());
+fn encode_segment(data: &[u8], turbo: bool) -> Vec<u8> {
+    let mut model = Predictor::new(data.len(), turbo);
     let mut enc = Encoder::new();
     for &byte in data {
         // MSB-first bit coding through the shared per-byte context tree.
@@ -177,8 +188,8 @@ fn encode_segment(data: &[u8]) -> Vec<u8> {
 }
 
 /// Decode a single segment of exactly `n` bytes.
-fn decode_segment(payload: &[u8], n: usize) -> Vec<u8> {
-    let mut model = Predictor::new(n);
+fn decode_segment(payload: &[u8], n: usize, turbo: bool) -> Vec<u8> {
+    let mut model = Predictor::new(n, turbo);
     let mut dec = Decoder::new(payload);
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
@@ -207,15 +218,26 @@ mod tests {
 
     /// Round-trip with an explicit (small) segment size to exercise the
     /// multi-segment parallel framing without needing multi-MiB inputs. The
-    /// segment size is recovered from the payload, so decode needs no hint.
+    /// segment size and profile are recovered from the payload, so decode
+    /// needs no hint. Both model profiles are exercised.
     fn roundtrip_segmented(data: &[u8], seg: usize) {
-        let payload = encode_framed(data, seg);
-        let decoded = decode_framed(&payload, data.len());
-        assert_eq!(
-            decoded, data,
-            "segmented roundtrip mismatch (seg={seg}, {} bytes)",
-            data.len()
-        );
+        for turbo in [false, true] {
+            let payload = encode_framed(data, seg, turbo);
+            let decoded = decode_framed(&payload, data.len());
+            assert_eq!(
+                decoded, data,
+                "segmented roundtrip mismatch (seg={seg}, turbo={turbo}, {} bytes)",
+                data.len()
+            );
+        }
+    }
+
+    #[test]
+    fn rt_turbo_profile() {
+        // Levels 1-3 use the turbo profile end-to-end.
+        let s = "the quick brown fox jumps over the lazy dog. ".repeat(400);
+        let payload = encode(s.as_bytes(), 2);
+        assert_eq!(decode(&payload, s.len()), s.as_bytes());
     }
 
     #[test]
@@ -248,8 +270,8 @@ mod tests {
         // One big segment vs many small ones should both round-trip; this also
         // documents that segmentation only adds the small per-segment header.
         let s = "compression test data ".repeat(2000);
-        let one = encode_framed(s.as_bytes(), s.len() + 1);
-        let many = encode_framed(s.as_bytes(), 4096);
+        let one = encode_framed(s.as_bytes(), s.len() + 1, false);
+        let many = encode_framed(s.as_bytes(), 4096, false);
         assert_eq!(decode_framed(&one, s.len()), s.as_bytes());
         assert_eq!(decode_framed(&many, s.len()), s.as_bytes());
     }
