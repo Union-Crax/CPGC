@@ -26,7 +26,9 @@
 //!    is deterministic so it costs no signalling.
 //! 7. **A runtime-SIMD mixer** (AVX2 with a bit-identical scalar fallback)
 //!    and **two model profiles** (turbo for levels 1-3, full for 4-9; the
-//!    profile byte travels in the payload header).
+//!    profile byte travels in the payload header). Turbo keeps the stride
+//!    models — so binary media still compresses — but runs a reduced
+//!    context roster, compact mixer rows and an earlier match fast-path.
 //!
 //! ## Scaling to big archives
 //!

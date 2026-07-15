@@ -65,21 +65,44 @@ fn codec_roundtrip_random_looking() {
 
 #[test]
 fn codec_header_magic_version() {
-    // "test" = 4 bytes → 1 block (VERSION 8 header layout)
-    let compressed = compress(b"test", 1).unwrap();
+    // Compressible input → full VERSION 9 header layout (not the stored form).
+    let data: Vec<u8> = b"abcabcabc ".iter().cycle().take(2000).cloned().collect();
+    let compressed = compress(&data, 1).unwrap();
     assert_eq!(&compressed[0..4], b"CPGC", "magic bytes wrong");
-    assert_eq!(compressed[4], 8, "version should be 8");
-    // flags at [5]; orig_len at [6..14]
+    assert_eq!(compressed[4], 9, "version should be 9");
+    let flags = compressed[5];
+    assert_eq!(flags & 4, 0, "compressible input must not use the stored form");
+    // orig_len at [6..14]
     let len = u64::from_le_bytes(compressed[6..14].try_into().unwrap());
-    assert_eq!(len, 4, "stored length wrong");
+    assert_eq!(len, 2000, "stored length wrong");
     // crc32 at [14..18] must equal CRC-32 of the original bytes
     let crc = u32::from_le_bytes(compressed[14..18].try_into().unwrap());
-    assert_eq!(crc, crc32fast::hash(b"test"), "stored crc32 wrong");
-    // n_blocks at [18..22]: 4 bytes → 1 block
+    assert_eq!(crc, crc32fast::hash(&data), "stored crc32 wrong");
+    // n_blocks at [18..22]: 2000 bytes → 1 block
     let n_blocks = u32::from_le_bytes(compressed[18..22].try_into().unwrap());
     assert_eq!(n_blocks, 1, "should be 1 block");
     // block_tag[0] at [22]: level=1 → no transform → 0x00
     assert_eq!(compressed[22], 0x00, "block tag should be 0x00 (no transform)");
+}
+
+#[test]
+fn codec_never_expands_by_more_than_header() {
+    // Incompressible input must fall back to the stored form: at most 18
+    // bytes (the stored header) of overhead, never per-block tag growth.
+    let mut x: u64 = 0x0123_4567_89ab_cdef;
+    let data: Vec<u8> = (0..100_000).map(|_| {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (x >> 56) as u8
+    }).collect();
+    for level in [1u8, 5, 9] {
+        let compressed = compress(&data, level).unwrap();
+        assert!(
+            compressed.len() <= data.len() + 18,
+            "level {level}: output expanded by {} bytes",
+            compressed.len() as i64 - data.len() as i64
+        );
+        assert_eq!(decompress(&compressed).unwrap(), data, "stored roundtrip failed");
+    }
 }
 
 #[test]

@@ -75,9 +75,16 @@ shared with the PAQ family, but the model below is specific to this codec):
   path when the CPU has it, with a scalar fallback that is bit-identical
   (every product fits i32 exactly; sums widen to i64), so archives decode
   across machines regardless of CPU features. No compile flags needed.
-- **Two model profiles** — levels 1–3 run a turbo roster (orders 2–5 + word,
-  two mixer views, two APMs) recorded as a byte in the payload; levels 4–9
-  run everything. Turbo is ~2.2x faster and still beats the classical tools.
+- **Two model profiles** — levels 1–3 run a turbo roster (orders 2–5 + word
+  plus the four stride models, two mixer views, two APMs, compact mixer rows
+  and an earlier fast-path switch) recorded as a byte in the payload; levels
+  4–9 run everything. Turbo is ~2–3x faster and, because it keeps the stride
+  models, binary media (PCM audio, RGB images) compresses nearly as well as
+  with the full model.
+- **Never expands** — if the compressed assembly would be larger than the
+  input, the encoder falls back to a **stored** archive form: worst case is
+  the input plus an 18-byte header, even for already-compressed or encrypted
+  data at any level.
 
 Every archive stores a **CRC-32 of the original bytes**, verified after
 decoding: a corrupt archive — or one written by an incompatible model version —
@@ -110,8 +117,12 @@ with cores — so on big archives CPGC-NX is not only smaller than xz but
 > smaller *and* ~2.4x faster than v6 at once); v8 added a runtime-detected
 > AVX2 mixer (bit-exact with the scalar path), **two-speed coding** (long
 > verified matches are coded by a tiny match-confidence model, skipping the
-> whole mixer), and a **turbo profile** at levels 1–3. The figures below are
-> therefore conservative.
+> whole mixer), and a **turbo profile** at levels 1–3. v9 fixed the two v8
+> regressions — the turbo profile had dropped the stride models (costing ~20
+> ratio points on binary media; they're back, with compact mixer rows paying
+> for them) — and added a **stored fallback** so no input can grow by more
+> than 18 bytes (previously incompressible data expanded by 1 byte per 4 KiB
+> block). The figures below are therefore conservative.
 >
 > Fresh v8 measurements on the current `corpus/` files (verified round-trips),
 > against every big-name tool at its maximum setting. Sizes in bytes, times

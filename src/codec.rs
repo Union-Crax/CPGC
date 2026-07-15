@@ -1,13 +1,15 @@
 //! Top-level compress / decompress orchestration.
 //!
-//! ## File Format (VERSION 8)
+//! ## File Format (VERSION 9)
 //!
 //! ```text
 //! [0..4]                      magic: "CPGC"
-//! [4]                         version: 8
-//! [5]                         flags: bit0 = has_passthrough, bit1 = has_transforms
+//! [4]                         version: 9
+//! [5]                         flags: bit0 = has_passthrough, bit1 = has_transforms,
+//!                                    bit2 = stored (raw bytes follow the fixed header)
 //! [6..14]                     orig_len: u64 LE
 //! [14..18]                    crc32: u32 LE  (CRC-32 of the original bytes)
+//! --- stored archives end the header here; [18..] is the original data ---
 //! [18..22]                    n_blocks: u32 LE  (= ceil(orig_len / WINDOW_SIZE))
 //! [22..22+n_blocks]           block_tags: one byte per block
 //!                               0x00 = context-mixed, no transform
@@ -22,6 +24,13 @@
 //! by an incompatible model version — fails loudly instead of returning wrong
 //! bytes. Level < 5: no classify / transform pass; all block_tags = 0x00;
 //! passthrough_len = 0. Level ≥ 5: content analyzer + transform search enabled.
+//!
+//! The stored form (flags bit2) is the anti-expansion guarantee: whenever the
+//! compressed assembly would be larger than `STORED_HEADER + orig_len` — e.g.
+//! for already-compressed or encrypted input, where the per-block tag table
+//! alone used to grow the file — the encoder falls back to storing the bytes
+//! raw. Output is therefore never more than [`STORED_HEADER`] (18) bytes
+//! larger than the input, regardless of content or level.
 
 use anyhow::{anyhow, Result};
 
@@ -31,9 +40,12 @@ use crate::checksum::crc32;
 use crate::transform::search::{find_best_transform, CANDIDATES};
 
 const MAGIC: &[u8; 4] = b"CPGC";
-const VERSION: u8 = 8;
+const VERSION: u8 = 9;
 /// Smallest possible header: magic+ver+flags+orig_len+crc32+n_blocks+passthrough_len.
 const HEADER_MIN: usize = 4 + 1 + 1 + 8 + 4 + 4 + 4;
+/// Header of a stored (uncompressed-fallback) archive: magic+ver+flags+orig_len+crc32.
+const STORED_HEADER: usize = 4 + 1 + 1 + 8 + 4;
+const FLAG_STORED: u8 = 4;
 const TAG_NORMAL: u8 = 0x00;
 const TAG_PASSTHROUGH: u8 = 0xFF;
 
@@ -140,19 +152,35 @@ pub fn compress_with_control(input: &[u8], level: u8, ctrl: &cm::Control) -> Res
         (if passthrough_data.is_empty() { 0u8 } else { 1u8 })
         | (if block_tags.iter().any(|&t| t != TAG_NORMAL && t != TAG_PASSTHROUGH) { 2u8 } else { 0u8 });
 
+    let crc = crc32(input);
     let total = HEADER_MIN + n_blocks + passthrough_data.len() + ans_payload.len();
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(MAGIC);
-    out.push(VERSION);
-    out.push(flags);
-    out.extend_from_slice(&(n as u64).to_le_bytes());
-    out.extend_from_slice(&crc32(input).to_le_bytes());
-    out.extend_from_slice(&(n_blocks as u32).to_le_bytes());
-    out.extend_from_slice(&block_tags);
-    out.extend_from_slice(&(passthrough_data.len() as u32).to_le_bytes());
-    out.extend_from_slice(&passthrough_data);
-    out.extend_from_slice(&ans_payload);
-    Ok(out)
+
+    // Anti-expansion guard: if the compressed assembly beats storing the raw
+    // bytes, emit it; otherwise fall back to the stored form, so the output
+    // is never more than STORED_HEADER bytes larger than the input.
+    if total < STORED_HEADER + n {
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(MAGIC);
+        out.push(VERSION);
+        out.push(flags);
+        out.extend_from_slice(&(n as u64).to_le_bytes());
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(&(n_blocks as u32).to_le_bytes());
+        out.extend_from_slice(&block_tags);
+        out.extend_from_slice(&(passthrough_data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&passthrough_data);
+        out.extend_from_slice(&ans_payload);
+        Ok(out)
+    } else {
+        let mut out = Vec::with_capacity(STORED_HEADER + n);
+        out.extend_from_slice(MAGIC);
+        out.push(VERSION);
+        out.push(FLAG_STORED);
+        out.extend_from_slice(&(n as u64).to_le_bytes());
+        out.extend_from_slice(&crc.to_le_bytes());
+        out.extend_from_slice(input);
+        Ok(out)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -167,7 +195,7 @@ pub fn decompress(input: &[u8]) -> Result<Vec<u8>> {
 /// Decompress with a shared [`cm::Control`] for pause/resume/cancel and a live
 /// byte counter (used by the GUI). Returns an error if cancelled.
 pub fn decompress_with_control(input: &[u8], ctrl: &cm::Control) -> Result<Vec<u8>> {
-    if input.len() < HEADER_MIN {
+    if input.len() < STORED_HEADER {
         return Err(anyhow!("input too short for CPGC header"));
     }
     if &input[0..4] != MAGIC {
@@ -180,9 +208,25 @@ pub fn decompress_with_control(input: &[u8], ctrl: &cm::Control) -> Result<Vec<u
             input[4], VERSION
         ));
     }
-    // input[5] = flags (reserved for decoder use; currently informational)
+    let flags = input[5];
     let orig_len  = u64::from_le_bytes(input[6..14].try_into().unwrap()) as usize;
     let crc_expected = u32::from_le_bytes(input[14..18].try_into().unwrap());
+
+    // Stored archive: the original bytes follow the fixed header verbatim.
+    if flags & FLAG_STORED != 0 {
+        if input.len() < STORED_HEADER + orig_len {
+            return Err(anyhow!("truncated stored archive"));
+        }
+        let data = &input[STORED_HEADER..STORED_HEADER + orig_len];
+        if crc32(data) != crc_expected {
+            return Err(anyhow!("checksum mismatch: stored archive is corrupt"));
+        }
+        return Ok(data.to_vec());
+    }
+
+    if input.len() < HEADER_MIN {
+        return Err(anyhow!("input too short for CPGC header"));
+    }
     let n_blocks  = u32::from_le_bytes(input[18..22].try_into().unwrap()) as usize;
 
     let tags_end = 22 + n_blocks;
