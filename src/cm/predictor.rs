@@ -66,11 +66,15 @@ const MATCH_EMPTY: u32 = u32::MAX;
 // lockstep, so it is perfectly deterministic.
 const FAST_LEN: u32 = 128;
 
+/// Unclamped size target for `n` input bytes: a table a few times larger
+/// than the input.
+fn raw_bits(n: usize) -> u32 {
+    (usize::BITS - n.max(1).leading_zeros()) + 2
+}
+
 /// Pick a power-of-two table exponent appropriate for `n` input bytes.
 fn table_bits(n: usize) -> u32 {
-    // Aim for a table a few times larger than the input, clamped to range.
-    let target = (usize::BITS - n.max(1).leading_zeros()) + 2;
-    target.clamp(HBITS_MIN, HBITS_MAX)
+    raw_bits(n).clamp(HBITS_MIN, HBITS_MAX)
 }
 
 /// Bucket-count exponent for bit-history model `k`. The `big` profile
@@ -80,17 +84,21 @@ fn table_bits(n: usize) -> u32 {
 /// single factor. Sparse/stride contexts are low-cardinality, so they stay
 /// capped regardless.
 fn model_bits(k: usize, n: usize, big: bool) -> u32 {
-    let base = table_bits(n);
+    // `raw_bits` is deliberately unclamped here: a 100 MB segment needs
+    // 2^23-bucket tables (128 MiB per hashed model), and the standard
+    // HBITS_MAX clamp was silently capping the big profile at 2^22 — the
+    // second half of a big segment then thrashed the tables and levels 8-9
+    // compressed *worse* than level 7.
     let hash_bits = if big {
-        base.clamp(11, 22)
+        raw_bits(n).clamp(11, 23)
     } else {
-        base.saturating_sub(3).clamp(11, 19)
+        raw_bits(n).clamp(HBITS_MIN, HBITS_MAX).saturating_sub(3).clamp(11, 19)
     };
     match MODEL_KIND[k] {
         Kind::Hash => hash_bits,
-        Kind::Sparse => hash_bits.min(if big { 20 } else { 16 }),
+        Kind::Sparse => hash_bits.min(if big { 21 } else { 16 }),
         Kind::Stride => hash_bits.min(16),
-        Kind::Ind => hash_bits.min(if big { 21 } else { 18 }),
+        Kind::Ind => hash_bits.min(if big { 22 } else { 18 }),
     }
 }
 
@@ -574,8 +582,13 @@ impl Predictor {
         let nbh = if turbo { NBH_TURBO } else { NBH };
 
         // The match tables store one u32 per slot; the big profile grows
-        // them 16x so long-range matches on a 100 MB+ segment survive.
-        let mbits = table_bits(n).min(if big { 24 } else { HBITS_MAX });
+        // them so long-range matches on a 100 MB+ segment survive (raw_bits,
+        // not table_bits: the standard clamp must not cap the big profile).
+        let mbits = if big {
+            raw_bits(n).clamp(HBITS_MIN, 24)
+        } else {
+            table_bits(n)
+        };
         let msize = 1usize << mbits;
 
         let ind3_bits: u32 = if big { 22 } else { 20 };
