@@ -83,24 +83,32 @@ fn table_bits(n: usize) -> u32 {
 /// the standard tables, and evictions were costing more ratio than any other
 /// single factor. Sparse/stride contexts are low-cardinality, so they stay
 /// capped regardless.
-fn model_bits(k: usize, n: usize, big: bool) -> u32 {
+fn model_bits(k: usize, n: usize, mem: u8) -> u32 {
     // `raw_bits` is deliberately unclamped here: a 100 MB segment needs
-    // 2^23-bucket tables (128 MiB per hashed model), and the standard
+    // 2^23+-bucket tables (128+ MiB per hashed model), and the standard
     // HBITS_MAX clamp was silently capping the big profile at 2^22 — the
     // second half of a big segment then thrashed the tables and levels 8-9
-    // compressed *worse* than level 7.
-    let hash_bits = if big {
-        raw_bits(n).clamp(11, 23)
+    // compressed *worse* than level 7. MEM_PLUS doubles every cap again so
+    // a single 100 MB segment carries the same per-byte table pressure as
+    // two 50 MB segments, while keeping the longer match window.
+    let plus = (mem >= MEM_PLUS) as u32;
+    let hash_bits = if mem >= MEM_BIG {
+        raw_bits(n).clamp(11, 23 + plus)
     } else {
         raw_bits(n).clamp(HBITS_MIN, HBITS_MAX).saturating_sub(3).clamp(11, 19)
     };
     match MODEL_KIND[k] {
         Kind::Hash => hash_bits,
-        Kind::Sparse => hash_bits.min(if big { 21 } else { 16 }),
+        Kind::Sparse => hash_bits.min(if mem >= MEM_BIG { 21 + plus } else { 16 }),
         Kind::Stride => hash_bits.min(16),
-        Kind::Ind => hash_bits.min(if big { 22 } else { 18 }),
+        Kind::Ind => hash_bits.min(if mem >= MEM_BIG { 22 + plus } else { 18 }),
     }
 }
+
+// Memory profiles (recorded in the payload so decode always agrees).
+pub const MEM_STD: u8 = 0;
+pub const MEM_BIG: u8 = 1; // levels 7+: up to 2^23-bucket hash tables
+pub const MEM_PLUS: u8 = 2; // levels 8-9: up to 2^24 buckets, 2^25 match slots
 
 const RATE_FAST: i32 = 3;
 
@@ -571,27 +579,27 @@ pub struct Predictor {
 }
 
 impl Predictor {
-    /// `turbo` selects the reduced low-level profile; `big` selects the
-    /// large-memory profile (levels >= 7). Both change the bitstream, so the
-    /// codec records them in the payload header.
-    pub fn new(n: usize, turbo: bool, big: bool) -> Self {
+    /// `turbo` selects the reduced low-level profile; `mem` selects the
+    /// memory profile (MEM_STD / MEM_BIG / MEM_PLUS). Both change the
+    /// bitstream, so the codec records them in the payload header.
+    pub fn new(n: usize, turbo: bool, mem: u8) -> Self {
         let _ = squash(0);
         let _ = stretch(2048);
         let _ = st_direct_tbl();
 
         let nbh = if turbo { NBH_TURBO } else { NBH };
 
-        // The match tables store one u32 per slot; the big profile grows
+        // The match tables store one u32 per slot; the big profiles grow
         // them so long-range matches on a 100 MB+ segment survive (raw_bits,
-        // not table_bits: the standard clamp must not cap the big profile).
-        let mbits = if big {
-            raw_bits(n).clamp(HBITS_MIN, 24)
+        // not table_bits: the standard clamp must not cap the big profiles).
+        let mbits = if mem >= MEM_BIG {
+            raw_bits(n).clamp(HBITS_MIN, 24 + (mem >= MEM_PLUS) as u32)
         } else {
             table_bits(n)
         };
         let msize = 1usize << mbits;
 
-        let ind3_bits: u32 = if big { 22 } else { 20 };
+        let ind3_bits: u32 = if mem >= MEM_BIG { 22 } else { 20 };
 
         // Initialise the second-layer weights so the mixer starts out close to
         // an average of its active view inputs (two in turbo, four in full);
@@ -625,7 +633,7 @@ impl Predictor {
             ind2_idx: 0,
             ind3_idx: 0,
             bh: (0..nbh)
-                .map(|k| BhTable::new(model_bits(k, n, big)))
+                .map(|k| BhTable::new(model_bits(k, n, mem)))
                 .collect(),
             bh_sm: vec![sm_init(); nbh],
             nbh,

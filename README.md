@@ -9,9 +9,11 @@ predictor feeding a binary arithmetic coder.
 > re-pointed at what the tool actually is. The acronym, the CLI name and the
 > `CPGC` magic bytes are unchanged.
 
-**Status: on general text it beats gzip, bzip2 and xz/LZMA on ratio.** It does
-not beat the heaviest research compressors (cmix/PAQ8), and on tiny files or
-already-dense binaries bzip2/xz can still edge it.
+**Status: on general text it beats gzip, bzip2, xz/LZMA, zstd, brotli and
+7-Zip's PPMd on ratio** — see the [enwik8 benchmark](#the-english-wikipedia-benchmark-enwik8)
+below, measured against the Large Text Compression Benchmark reference
+results. It does not beat the heaviest research compressors (zpaq/cmix/PAQ8),
+and on tiny files or already-dense binaries bzip2/xz can still edge it.
 
 ---
 
@@ -75,9 +77,29 @@ shared with the PAQ family, but the model below is specific to this codec):
   path when the CPU has it, with a scalar fallback that is bit-identical
   (every product fits i32 exactly; sums widen to i64), so archives decode
   across machines regardless of CPU features. No compile flags needed.
-- **Two model profiles** — levels 1–3 run a turbo roster (orders 2–5 + word,
-  two mixer views, two APMs) recorded as a byte in the payload; levels 4–9
-  run everything. Turbo is ~2.2x faster and still beats the classical tools.
+- **Indirect context models** — two models keyed by *the byte that followed
+  the same order-2/order-3 context last time* (v9). On natural-language text
+  "what came after this bigram before" is a sharper cue than the bigram
+  alone.
+- **Text contexts** — hashed order-8 and order-10 (Wikipedia markup repeats
+  at 8–12 byte scale, bridging order-7 and the match model) and a
+  case-folded order-3 that merges "The"/"the" statistics (v9).
+- **Model profiles** — levels 1–3 run a turbo roster (orders 2–5 + word,
+  two mixer views, two APMs), ~2.2x faster and still ahead of the classical
+  tools; levels 4–6 run the full 23-model roster; levels 7–9 add the
+  **big-memory profiles** (v9): hashed context tables up to 2^23–2^24
+  buckets and match tables up to 2^25 slots, sized from the segment length.
+  A 100 MB text segment has far more distinct order-4..7 contexts than the
+  standard tables can hold — before v9, eviction thrash was the single
+  biggest ratio cost on big files. The profile byte is recorded in the
+  payload, so decoding never depends on the level mapping.
+- **Adaptive word-dictionary transform** (v9, turbo levels) — texty inputs
+  are word-tokenized against a dictionary *mined from the input itself*
+  (no shipped dictionary, language-agnostic, exactly invertible; tokens are
+  built only from byte values unused in the input, so no escaping exists).
+  The stream shrinks ~40%, which is a direct CPU saving at the turbo levels.
+  The full model extracts more from raw characters than from tokens, so
+  levels ≥ 4 skip it.
 
 Every archive stores a **CRC-32 of the original bytes**, verified after
 decoding: a corrupt archive — or one written by an incompatible model version —
@@ -102,7 +124,7 @@ with cores — so on big archives CPGC-NX is not only smaller than xz but
 
 ## Measured results
 
-> **Note:** the reference table below predates the current (v8) engine. The
+> **Note:** the reference table below predates the current (v9) engine. The
 > lineage: v5 added count-adaptive counters, orders 0–7 and a two-layer
 > learned mixer; v6 added indirect bit-history models, a word-pair context, a
 > dual match model and a partial-byte mixer view + APM; v7 rebuilt the entire
@@ -110,8 +132,11 @@ with cores — so on big archives CPGC-NX is not only smaller than xz but
 > smaller *and* ~2.4x faster than v6 at once); v8 added a runtime-detected
 > AVX2 mixer (bit-exact with the scalar path), **two-speed coding** (long
 > verified matches are coded by a tiny match-confidence model, skipping the
-> whole mixer), and a **turbo profile** at levels 1–3. The figures below are
-> therefore conservative.
+> whole mixer), and a **turbo profile** at levels 1–3; v9 fixed a
+> **mixer-overflow collapse on segments larger than ~12 MiB** (levels 6–9 on
+> big files used to silently degrade to ~4.4 bits/byte), added the
+> big-memory profiles, indirect + high-order text contexts, and the
+> word-dictionary transform. The figures below are therefore conservative.
 >
 > Fresh v8 measurements on the current `corpus/` files (verified round-trips),
 > against every big-name tool at its maximum setting. Sizes in bytes, times
@@ -290,12 +315,19 @@ Register from a stable location: copy `cpgc.exe` somewhere permanent and run
 
 ## Compression levels
 
-`-l`/`--level` (1–9, default 5) trades speed for ratio by setting the parallel
-**segment size**: lower levels use smaller segments (more cores, faster, a
-little larger), higher levels use larger segments (better ratio, less
-parallelism). The size is recorded in the archive, so decompression never needs
-to know the level. Levels ≥ 5 also enable the transform pass. Example on 9 MB of
-text:
+`-l`/`--level` (1–9, default 5) trades speed and memory for ratio along three
+axes, all recorded in the archive so decompression never needs to know the
+level:
+
+- **Segment size** — lower levels use smaller parallel segments (more cores,
+  faster, a little larger), higher levels use larger segments.
+- **Model profile** — levels 1–3 run the turbo roster plus the
+  word-dictionary transform on text; levels 4–9 run the full model.
+- **Memory profile** — level 7 runs big tables (~1 GB per 64 MiB segment),
+  levels 8–9 run extra-large tables (~4 GB per 100 MB segment). If you don't
+  have the RAM for the top levels on huge files, use 5–7.
+
+Levels ≥ 5 also enable the transform pass. Example on 9 MB of text:
 
 | level | size | bits/byte | speed |
 |--:|--:|--:|--:|
