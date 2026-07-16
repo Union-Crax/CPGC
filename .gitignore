@@ -28,3 +28,4 @@ dev.md
 # Inno Setup output
 /dist/
 /installer/Output/
+bench_data/
