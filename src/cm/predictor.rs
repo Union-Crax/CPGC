@@ -66,12 +66,49 @@ const MATCH_EMPTY: u32 = u32::MAX;
 // lockstep, so it is perfectly deterministic.
 const FAST_LEN: u32 = 128;
 
+/// Unclamped size target for `n` input bytes: a table a few times larger
+/// than the input.
+fn raw_bits(n: usize) -> u32 {
+    (usize::BITS - n.max(1).leading_zeros()) + 2
+}
+
 /// Pick a power-of-two table exponent appropriate for `n` input bytes.
 fn table_bits(n: usize) -> u32 {
-    // Aim for a table a few times larger than the input, clamped to range.
-    let target = (usize::BITS - n.max(1).leading_zeros()) + 2;
-    target.clamp(HBITS_MIN, HBITS_MAX)
+    raw_bits(n).clamp(HBITS_MIN, HBITS_MAX)
 }
+
+/// Bucket-count exponent for bit-history model `k`. The `big` profile
+/// (levels >= 7) grows the hashed-context tables 8x: on a large text segment
+/// the population of distinct order-4..7 and word contexts vastly exceeds
+/// the standard tables, and evictions were costing more ratio than any other
+/// single factor. Sparse/stride contexts are low-cardinality, so they stay
+/// capped regardless.
+fn model_bits(k: usize, n: usize, mem: u8) -> u32 {
+    // `raw_bits` is deliberately unclamped here: a 100 MB segment needs
+    // 2^23+-bucket tables (128+ MiB per hashed model), and the standard
+    // HBITS_MAX clamp was silently capping the big profile at 2^22 — the
+    // second half of a big segment then thrashed the tables and levels 8-9
+    // compressed *worse* than level 7. MEM_PLUS doubles every cap again so
+    // a single 100 MB segment carries the same per-byte table pressure as
+    // two 50 MB segments, while keeping the longer match window.
+    let plus = (mem >= MEM_PLUS) as u32;
+    let hash_bits = if mem >= MEM_BIG {
+        raw_bits(n).clamp(11, 23 + plus)
+    } else {
+        raw_bits(n).clamp(HBITS_MIN, HBITS_MAX).saturating_sub(3).clamp(11, 19)
+    };
+    match MODEL_KIND[k] {
+        Kind::Hash => hash_bits,
+        Kind::Sparse => hash_bits.min(if mem >= MEM_BIG { 21 + plus } else { 16 }),
+        Kind::Stride => hash_bits.min(16),
+        Kind::Ind => hash_bits.min(if mem >= MEM_BIG { 22 + plus } else { 18 }),
+    }
+}
+
+// Memory profiles (recorded in the payload so decode always agrees).
+pub const MEM_STD: u8 = 0;
+pub const MEM_BIG: u8 = 1; // levels 7+: up to 2^23-bucket hash tables
+pub const MEM_PLUS: u8 = 2; // levels 8-9: up to 2^24 buckets, 2^25 match slots
 
 const RATE_FAST: i32 = 3;
 
@@ -264,11 +301,37 @@ const NSTRIDE: usize = STRIDES.len();
 
 // Bit-history models: hashed orders 2..7, the current word, the
 // previous-word/current-word pair, two sparse contexts (skip-gram and
-// high-nibble), then the four stride contexts. Sparse and stride contexts
-// are low-cardinality, so their tables are capped smaller.
+// high-nibble), the four stride contexts, and two *indirect* contexts
+// (keyed by the byte that followed the same context last time — strong on
+// natural-language text, where "what came after this bigram before" is a
+// better cue than the bigram alone). Sparse and stride contexts are
+// low-cardinality, so their tables are capped smaller.
 const NHASH: usize = 8;
 const NSPARSE: usize = 6;
-const NBH: usize = NHASH + NSPARSE + NSTRIDE; // 18 bit-history models
+const NIND: usize = 2;
+const NTEXT: usize = 3; // order-8, order-10, case-folded order-3
+const NBH: usize = NHASH + NSPARSE + NSTRIDE + NIND + NTEXT; // 23 bit-history models
+
+// Per-model table kind, indexed like `bh_base`: how big a hash table the
+// model's context population deserves.
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Hash,   // hashed high-order / word contexts: unbounded population
+    Sparse, // skip-grams: bounded by 2 bytes of context
+    Stride, // fixed-lane media contexts: low cardinality
+    Ind,    // indirect contexts: bounded by (byte, order-1/2)
+}
+const MODEL_KIND: [Kind; NBH] = [
+    Kind::Hash, Kind::Hash, Kind::Hash, Kind::Hash, // orders 2-5
+    Kind::Hash,                                     // word
+    Kind::Hash, Kind::Hash,                         // orders 6-7
+    Kind::Hash,                                     // word pair
+    Kind::Sparse, Kind::Sparse, Kind::Sparse, Kind::Sparse, Kind::Sparse, Kind::Sparse,
+    Kind::Stride, Kind::Stride, Kind::Stride, Kind::Stride,
+    Kind::Ind, Kind::Ind,
+    Kind::Hash, Kind::Hash,                         // orders 8, 10
+    Kind::Hash,                                     // case-folded order-3
+];
 // The turbo profile (levels 1-3) runs only the first NBH_TURBO models
 // (orders 2-5 + word), two mixer views and two APMs — a several-times-faster
 // engine that still beats the classical tools on ratio.
@@ -287,11 +350,18 @@ const BH_IN: usize = 4; // first bit-history input index
 const MATCH_IN: usize = BH_IN + NBH * 2;
 const BIAS_IN: usize = NIN - 1;
 
+// First-layer weight-set row counts. The `wc` view is selected by a hashed
+// order-2 context (2048 rows) rather than the single previous-previous byte:
+// on text, which pair of bytes precedes the position is a far sharper cue
+// for which models to trust than either byte alone.
+const WC_ROWS: usize = 2048;
+
 // Second-layer mixer: combines the four first-layer outputs plus a bias.
 const NMIX: usize = 5;
-// Selected by (min(match_len, 7), bit position): the combiner learns, e.g.,
-// to trust the match view less on low bits and counter views more there.
-const NMIX_CTX: usize = 64;
+// Selected by (is-text flag, min(match_len, 7), bit position): the combiner
+// learns, e.g., to trust the match view less on low bits and counter views
+// more there — with separate weights inside words vs elsewhere.
+const NMIX_CTX: usize = 128;
 
 // Mixer learning rate (scales the coding-error gradient applied to weights).
 const MIX_LR: i32 = 5;
@@ -380,7 +450,8 @@ impl DualCounter {
 
 struct Apm {
     t: Vec<u16>,
-    idx: usize,
+    base: usize,
+    w: i32,
 }
 
 impl Apm {
@@ -392,7 +463,7 @@ impl Apm {
                 t[c * 33 + j] = (p << 4) as u16;
             }
         }
-        Self { t, idx: 0 }
+        Self { t, base: 0, w: 0 }
     }
 
     #[inline]
@@ -400,19 +471,25 @@ impl Apm {
         let s = (stretch(pr) + 2048).clamp(0, 4095);
         let j = (s >> 7) as usize;
         let w = s & 127;
-        let base = cxt * 33 + j;
-        self.idx = base + (w >> 6) as usize;
-        let lo = self.t[base] as i32;
-        let hi = self.t[base + 1] as i32;
+        self.base = cxt * 33 + j;
+        self.w = w;
+        let lo = self.t[self.base] as i32;
+        let hi = self.t[self.base + 1] as i32;
         let p16 = (lo * (128 - w) + hi * w) >> 7;
         (p16 >> 4).clamp(1, 4095)
     }
 
+    /// Update *both* interpolation endpoints, each in proportion to the
+    /// weight it contributed to the prediction — the same total learning
+    /// rate as a single-node update, but the map stays smooth instead of
+    /// developing staircase artifacts at node boundaries.
     #[inline]
     fn update(&mut self, bit: i32) {
         let target = bit << 16;
-        let v = self.t[self.idx] as i32;
-        self.t[self.idx] = (v + ((target - v) >> 7)) as u16;
+        let lo = self.t[self.base] as i32;
+        let hi = self.t[self.base + 1] as i32;
+        self.t[self.base] = (lo + (((target - lo) * (128 - self.w)) >> 14)) as u16;
+        self.t[self.base + 1] = (hi + (((target - hi) * self.w) >> 14)) as u16;
     }
 }
 
@@ -428,9 +505,19 @@ pub struct Predictor {
     idx1: usize,
 
     // Rolling byte history (hist[0] = most recent).
-    hist: [u8; 8],
+    hist: [u8; 16],
     word_hash: u32,
     last_word: u32, // hash of the most recently *finished* word
+
+    // Indirect context state: per-context "byte that followed last time".
+    // ind2 is direct-indexed by the order-2 context (collision-free); ind3
+    // is indexed by a hashed order-3 context. A collision only yields a
+    // noisy context input — never an incorrect decode.
+    ind2: Vec<u8>,
+    ind3: Vec<u8>,
+    ind3_mask: u32,
+    ind2_idx: usize, // slot to write the *next* committed byte into
+    ind3_idx: usize,
 
     // Bit-history models: nibble-bucketed state tables + per-model state maps.
     bh: Vec<BhTable>,            // NBH tables
@@ -492,25 +579,27 @@ pub struct Predictor {
 }
 
 impl Predictor {
-    /// `turbo` selects the reduced low-level profile. It changes the
-    /// bitstream, so the codec records it in the payload header.
-    pub fn new(n: usize, turbo: bool) -> Self {
+    /// `turbo` selects the reduced low-level profile; `mem` selects the
+    /// memory profile (MEM_STD / MEM_BIG / MEM_PLUS). Both change the
+    /// bitstream, so the codec records them in the payload header.
+    pub fn new(n: usize, turbo: bool, mem: u8) -> Self {
         let _ = squash(0);
         let _ = stretch(2048);
         let _ = st_direct_tbl();
 
         let nbh = if turbo { NBH_TURBO } else { NBH };
 
-        // Bucket counts: states are 1 byte (16-byte buckets serve a whole
-        // nibble), so the tables are far smaller than v6's 6-byte-slot tables
-        // at equal context capacity. Stride contexts are low-cardinality, so
-        // their tables are capped harder to stay cache-friendly.
-        let bh_bits = (table_bits(n).saturating_sub(3)).clamp(11, 19);
-        let stride_bits = bh_bits.min(16);
-
-        // The match tables store one u32 per slot.
-        let mbits = table_bits(n).min(HBITS_MAX);
+        // The match tables store one u32 per slot; the big profiles grow
+        // them so long-range matches on a 100 MB+ segment survive (raw_bits,
+        // not table_bits: the standard clamp must not cap the big profiles).
+        let mbits = if mem >= MEM_BIG {
+            raw_bits(n).clamp(HBITS_MIN, 24 + (mem >= MEM_PLUS) as u32)
+        } else {
+            table_bits(n)
+        };
         let msize = 1usize << mbits;
+
+        let ind3_bits: u32 = if mem >= MEM_BIG { 22 } else { 20 };
 
         // Initialise the second-layer weights so the mixer starts out close to
         // an average of its active view inputs (two in turbo, four in full);
@@ -535,11 +624,16 @@ impl Predictor {
             t1: vec![DualCounter::INIT; 1 << 16],
             idx0: 0,
             idx1: 0,
-            hist: [0; 8],
+            hist: [0; 16],
             word_hash: 0,
             last_word: 0,
+            ind2: vec![0u8; 1 << 16],
+            ind3: vec![0u8; 1 << ind3_bits],
+            ind3_mask: (1u32 << ind3_bits) - 1,
+            ind2_idx: 0,
+            ind3_idx: 0,
             bh: (0..nbh)
-                .map(|k| BhTable::new(if k < NHASH { bh_bits } else { stride_bits }))
+                .map(|k| BhTable::new(model_bits(k, n, mem)))
                 .collect(),
             bh_sm: vec![sm_init(); nbh],
             nbh,
@@ -573,7 +667,7 @@ impl Predictor {
             },
             wa: vec![0i32; 256 * NINP],
             wb: vec![0i32; 64 * NINP],
-            wc: vec![0i32; 256 * NINP],
+            wc: vec![0i32; WC_ROWS * NINP],
             wd: vec![0i32; 256 * NINP],
             tx: [0; NINP],
             #[cfg(target_arch = "x86_64")]
@@ -590,8 +684,8 @@ impl Predictor {
             pr: 2048,
             apm0: Apm::new(256),
             apm1: Apm::new(256),
-            apm2: Apm::new(1024),
-            apm3: Apm::new(256),
+            apm2: Apm::new(16384),
+            apm3: Apm::new(WC_ROWS),
             final_pr: 2048,
         }
     }
@@ -695,26 +789,34 @@ impl Predictor {
         self.tx[BIAS_IN] = 256;
 
         // --- first-layer mixing: context-selected weight sets -------------
-        // (turbo runs only the prev-byte and partial-byte views)
+        // (turbo runs only the prev-byte and partial-byte views; ctx_c is a
+        // hashed order-2 selection, computed once per byte in next_byte)
         self.ctx_a = self.hist[0] as usize;
         self.ctx_b = (self.match_len.min(63)) as usize;
-        self.ctx_c = self.hist[1] as usize;
         self.ctx_d = (c0 & 0xff) as usize;
-        let sa = self.dot(&self.wa, self.ctx_a);
-        let sd = self.dot(&self.wd, self.ctx_d);
+        // Each view's output is clamped to ±2^15. The bound is far outside
+        // the useful stretch range (squash saturates near ±2047) so it never
+        // costs prediction sharpness, but it keeps the second-layer update
+        // products comfortably inside i64 *and* stops runaway feedback: with
+        // fully unbounded dots the combiner destabilised after ~12 MiB of a
+        // single segment and the model collapsed to ~4.4 bpb for the rest.
+        const S_CLAMP: i32 = 1 << 15;
+        let sa = self.dot(&self.wa, self.ctx_a).clamp(-S_CLAMP, S_CLAMP);
+        let sd = self.dot(&self.wd, self.ctx_d).clamp(-S_CLAMP, S_CLAMP);
         let (sb, sc) = if self.turbo {
             (0, 0)
         } else {
             (
-                self.dot(&self.wb, self.ctx_b),
-                self.dot(&self.wc, self.ctx_c),
+                self.dot(&self.wb, self.ctx_b).clamp(-S_CLAMP, S_CLAMP),
+                self.dot(&self.wc, self.ctx_c).clamp(-S_CLAMP, S_CLAMP),
             )
         };
 
         // --- second-layer mixing: a small learned combiner ---------------
         self.mi = [sa, sb, sc, sd, 256];
         let bits_seen = (31 - c0.leading_zeros()) as usize; // 0..7
-        self.ctx_f = (self.match_len.min(7) as usize) << 3 | bits_seen;
+        let in_word = self.hist[0].is_ascii_alphabetic() as usize;
+        self.ctx_f = in_word << 6 | (self.match_len.min(7) as usize) << 3 | bits_seen;
         let mixed = self.dot2(self.ctx_f);
         self.pr = squash(mixed);
 
@@ -725,7 +827,7 @@ impl Predictor {
             let p1 = self.apm1.refine(p, self.ctx_a);
             p = (p + p1 * 3) >> 2;
         }
-        let p2 = self.apm2.refine(p, (self.bh_base[1] & 0x3ff) as usize);
+        let p2 = self.apm2.refine(p, (self.bh_base[1] & 0x3fff) as usize);
         p = (p + p2 * 3) >> 2;
         if !self.turbo {
             let p3 = self.apm3.refine(p, self.ctx_c);
@@ -822,9 +924,12 @@ impl Predictor {
         Self::train(&mut self.wd, self.ctx_d, &self.tx, err, avx2);
 
         // Second-layer weights: same error, over the first-layer outputs.
+        // The product is widened to i64: |mi| can reach 2^15 and |err| 2^14.3,
+        // so the i32 form could overflow and corrupt the combiner.
         let base = self.ctx_f * NMIX;
         for i in 0..NMIX {
-            let nw = self.wf[base + i] + (((self.mi[i] * err) + 0x8000) >> 16);
+            let g = (((self.mi[i] as i64) * (err as i64) + 0x8000) >> 16) as i32;
+            let nw = self.wf[base + i] + g;
             self.wf[base + i] = nw.clamp(-(1 << 20), 1 << 20);
         }
 
@@ -899,8 +1004,13 @@ impl Predictor {
             let cand_short = self.match_table[h];
             self.match_table[h] = pos as u32;
             if self.match_len == 0 {
+                // Verify both candidates and keep the *longer* match: a
+                // deeper anchor predicts the continuation with more
+                // confidence, and the two hashes often disagree.
+                let mut best_ptr = 0usize;
+                let mut best_len = 0usize;
                 for cand in [cand_long, cand_short] {
-                    if cand != MATCH_EMPTY && (cand as usize) < pos {
+                    if cand != MATCH_EMPTY && (cand as usize) < pos && cand as usize != best_ptr {
                         let c = cand as usize;
                         let max = c.min(pos);
                         let mut l = 0usize;
@@ -908,12 +1018,15 @@ impl Predictor {
                         {
                             l += 1;
                         }
-                        if l >= MATCH_MIN {
-                            self.match_ptr = c;
-                            self.match_len = l as u32;
-                            break;
+                        if l > best_len {
+                            best_ptr = c;
+                            best_len = l;
                         }
                     }
+                }
+                if best_len >= MATCH_MIN {
+                    self.match_ptr = best_ptr;
+                    self.match_len = best_len as u32;
                 }
             }
         }
@@ -928,8 +1041,14 @@ impl Predictor {
         // same decoded history, so the choice never needs to be signalled.
         self.fast_mode = self.match_len >= FAST_LEN && self.match_byte >= 0;
 
+        // --- indirect bookkeeping -----------------------------------------
+        // Record the byte that just followed the previous order-2/order-3
+        // contexts (slots were resolved when those contexts were current).
+        self.ind2[self.ind2_idx] = byte;
+        self.ind3[self.ind3_idx] = byte;
+
         // --- context history --------------------------------------------
-        self.hist.copy_within(0..7, 1);
+        self.hist.copy_within(0..15, 1);
         self.hist[0] = byte;
         self.c0 = 1;
 
@@ -984,7 +1103,35 @@ impl Predictor {
                 h = (h ^ (b2 + 1)).wrapping_mul(PR1);
                 self.bh_base[NHASH + NSPARSE + k] = h ^ (h >> 15);
             }
+
+            // Indirect contexts: resolve the slot for the *new* order-2 /
+            // order-3 context, read the byte that followed it last time, and
+            // fold that byte into the model context. The committed byte will
+            // be written back into these same slots on the next call.
+            self.ind2_idx = ((self.hist[1] as usize) << 8) | self.hist[0] as usize;
+            self.ind3_idx = (hash_ctx(&self.hist[0..3], 53) & self.ind3_mask) as usize;
+            let b2 = self.ind2[self.ind2_idx];
+            let b3 = self.ind3[self.ind3_idx];
+            let ind_base = NHASH + NSPARSE + NSTRIDE;
+            self.bh_base[ind_base] = hash_ctx(&[b2, self.hist[0]], 47);
+            self.bh_base[ind_base + 1] = hash_ctx(&[b3, self.hist[0], self.hist[1]], 59);
+
+            // Text contexts: high orders bridge the gap between order-7 and
+            // the match model (Wikipedia markup repeats at 8-12 byte scale),
+            // and a case-folded order-3 merges "The"/"the" statistics.
+            let text_base = ind_base + NIND;
+            self.bh_base[text_base] = hash_ctx(&self.hist[0..8], 8);
+            self.bh_base[text_base + 1] = hash_ctx(&self.hist[0..10], 10);
+            let folded = [
+                self.hist[0] | 0x20,
+                self.hist[1] | 0x20,
+                self.hist[2] | 0x20,
+            ];
+            self.bh_base[text_base + 2] = hash_ctx(&folded, 67);
         }
+
+        // First-layer `wc` selection: hashed order-2, fixed for the byte.
+        self.ctx_c = (hash_ctx(&self.hist[0..2], 61) as usize) & (WC_ROWS - 1);
 
         // High-nibble bucket addresses are now known; start their lines early
         // (pointless when the next byte takes the fast path).

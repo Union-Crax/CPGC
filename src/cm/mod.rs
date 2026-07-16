@@ -114,9 +114,13 @@ pub const SEG_SIZE: usize = 16 << 20; // 16 MiB == level 5
 /// Map a 1–9 compression level to a segment size.
 ///
 /// Lower levels use smaller segments: more parallelism (faster) at a small
-/// ratio cost. Higher levels use larger segments: better ratio, less
-/// parallelism. The chosen size is stored in the payload, so decoding never
+/// ratio cost. The chosen size is stored in the payload, so decoding never
 /// depends on this mapping.
+///
+/// Segments cap at 64 MiB: measured on enwik8, a monolithic 100 MB segment
+/// compresses *worse* than two 50 MB segments even with double-size tables
+/// (text is nonstationary, and hashed-table pressure grows with the window),
+/// so past level 7 the ratio lever is the memory profile, not the window.
 pub fn seg_size_for_level(level: u8) -> usize {
     let bits: u32 = match level {
         0 | 1 => 20, // 1 MiB
@@ -125,9 +129,7 @@ pub fn seg_size_for_level(level: u8) -> usize {
         4 => 23,
         5 => 24, // 16 MiB (default)
         6 => 25,
-        7 => 26,
-        8 => 27,
-        _ => 28, // 256 MiB
+        _ => 26, // 64 MiB (levels 7-9)
     };
     1usize << bits
 }
@@ -143,23 +145,35 @@ pub fn seg_size_for_level(level: u8) -> usize {
 /// ```text
 /// [0..4]   seg_size: u32 LE   (bytes of original data per segment)
 /// [4..8]   n_seg: u32 LE
-/// [8]      profile: u8        (0 = full model, 1 = turbo)
+/// [8]      profile: u8        (0 = full model, 1 = turbo, 2 = full + big
+///                              memory, 3 = full + extra-large memory)
 /// [9..]    n_seg × (comp_len: u32 LE)
 /// [rest]   segment payloads, concatenated in order
 /// ```
 /// Segment `i` decompresses to `data[i*seg_size .. min((i+1)*seg_size, n)]`, so
 /// only the *compressed* lengths need to be stored. Levels 1-3 use the turbo
-/// profile (a reduced model roster, several times faster); the profile byte
-/// means decoding never depends on the level mapping.
+/// profile (a reduced model roster, several times faster); levels >= 7 use the
+/// big-memory profile (8x context tables, 16x match tables — a large ratio win
+/// on big text like Wikipedia dumps). The profile byte means decoding never
+/// depends on the level mapping.
 pub fn encode(data: &[u8], level: u8) -> Vec<u8> {
-    encode_framed(data, seg_size_for_level(level), level <= 3, &Control::new())
+    encode_framed(data, seg_size_for_level(level), level <= 3, mem_for_level(level), &Control::new())
         .expect("uncontrolled encode is never cancelled")
+}
+
+/// Memory profile per level: standard up to 6, big at 7, extra-large at 8-9.
+fn mem_for_level(level: u8) -> u8 {
+    match level {
+        0..=6 => predictor::MEM_STD,
+        7 => predictor::MEM_BIG,
+        _ => predictor::MEM_PLUS,
+    }
 }
 
 /// Compress with a shared [`Control`] for pause/resume/cancel and a live byte
 /// counter. Returns `None` if the job was cancelled before completing.
 pub fn encode_with_control(data: &[u8], level: u8, ctrl: &Control) -> Option<Vec<u8>> {
-    encode_framed(data, seg_size_for_level(level), level <= 3, ctrl)
+    encode_framed(data, seg_size_for_level(level), level <= 3, mem_for_level(level), ctrl)
 }
 
 /// Decode exactly `n` bytes from a payload produced by [`encode`].
@@ -177,17 +191,24 @@ pub fn decode_with_control(payload: &[u8], n: usize, ctrl: &Control) -> Option<V
 // Batching keeps the shared atomic cheap on the hot encode/decode loop.
 const CHECK_INTERVAL: usize = 1 << 12; // 4 KiB
 
-fn encode_framed(data: &[u8], seg_size: usize, turbo: bool, ctrl: &Control) -> Option<Vec<u8>> {
+fn encode_framed(
+    data: &[u8],
+    seg_size: usize,
+    turbo: bool,
+    mem: u8,
+    ctrl: &Control,
+) -> Option<Vec<u8>> {
     if data.is_empty() {
         return Some(Vec::new());
     }
     let seg_size = seg_size.max(1);
+    let mem = if turbo { predictor::MEM_STD } else { mem };
 
     // Compress each segment independently, in parallel. A cancelled segment
     // yields `None`, which collapses the whole result to `None`.
     let segments: Option<Vec<Vec<u8>>> = data
         .par_chunks(seg_size)
-        .map(|chunk| encode_segment(chunk, turbo, ctrl))
+        .map(|chunk| encode_segment(chunk, turbo, mem, ctrl))
         .collect();
     let segments = segments?;
 
@@ -197,7 +218,12 @@ fn encode_framed(data: &[u8], seg_size: usize, turbo: bool, ctrl: &Control) -> O
     let mut out = Vec::with_capacity(header + body);
     out.extend_from_slice(&(seg_size as u32).to_le_bytes());
     out.extend_from_slice(&(n_seg as u32).to_le_bytes());
-    out.push(turbo as u8);
+    out.push(match (turbo, mem) {
+        (true, _) => 1,
+        (false, predictor::MEM_BIG) => 2,
+        (false, predictor::MEM_PLUS) => 3,
+        (false, _) => 0,
+    });
     for s in &segments {
         out.extend_from_slice(&(s.len() as u32).to_le_bytes());
     }
@@ -213,7 +239,12 @@ fn decode_framed(payload: &[u8], n: usize, ctrl: &Control) -> Option<Vec<u8>> {
     }
     let seg_size = (u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize).max(1);
     let n_seg = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
-    let turbo = payload[8] != 0;
+    let turbo = payload[8] == 1;
+    let mem = match payload[8] {
+        2 => predictor::MEM_BIG,
+        3 => predictor::MEM_PLUS,
+        _ => predictor::MEM_STD,
+    };
     let comp_lens: Vec<usize> = (0..n_seg)
         .map(|i| {
             let o = 9 + 4 * i;
@@ -235,7 +266,7 @@ fn decode_framed(payload: &[u8], n: usize, ctrl: &Control) -> Option<Vec<u8>> {
     // Decode segments in parallel, then concatenate in order.
     let parts: Option<Vec<Vec<u8>>> = jobs
         .par_iter()
-        .map(|&(p, len)| decode_segment(p, len, turbo, ctrl))
+        .map(|&(p, len)| decode_segment(p, len, turbo, mem, ctrl))
         .collect();
     let parts = parts?;
 
@@ -246,9 +277,37 @@ fn decode_framed(payload: &[u8], n: usize, ctrl: &Control) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Diagnostic: encode `data` as a single segment, printing rolling output
+/// size every MiB (used to localise ratio regressions; not part of the API).
+#[doc(hidden)]
+pub fn probe_encode(data: &[u8], mem: u8) {
+    let mut model = Predictor::new(data.len(), false, mem);
+    let mut enc = coder::Encoder::new();
+    let mut last = 0usize;
+    for (i, &byte) in data.iter().enumerate() {
+        for bit_index in (0..8).rev() {
+            let bit = ((byte >> bit_index) & 1) as i32;
+            let p = model.predict();
+            enc.encode(bit, p);
+            model.update(bit);
+        }
+        model.next_byte(byte);
+        if (i + 1) % (1 << 20) == 0 {
+            let now = enc.out_len();
+            eprintln!(
+                "{:>4} MiB: total {:>9} B, last-MiB bpb {:.3}",
+                (i + 1) >> 20,
+                now,
+                (now - last) as f64 * 8.0 / (1 << 20) as f64
+            );
+            last = now;
+        }
+    }
+}
+
 /// Compress a single segment (no framing). Returns `None` if cancelled.
-fn encode_segment(data: &[u8], turbo: bool, ctrl: &Control) -> Option<Vec<u8>> {
-    let mut model = Predictor::new(data.len(), turbo);
+fn encode_segment(data: &[u8], turbo: bool, mem: u8, ctrl: &Control) -> Option<Vec<u8>> {
+    let mut model = Predictor::new(data.len(), turbo, mem);
     let mut enc = Encoder::new();
     let mut since_check = 0usize;
     for &byte in data {
@@ -274,8 +333,8 @@ fn encode_segment(data: &[u8], turbo: bool, ctrl: &Control) -> Option<Vec<u8>> {
 }
 
 /// Decode a single segment of exactly `n` bytes. Returns `None` if cancelled.
-fn decode_segment(payload: &[u8], n: usize, turbo: bool, ctrl: &Control) -> Option<Vec<u8>> {
-    let mut model = Predictor::new(n, turbo);
+fn decode_segment(payload: &[u8], n: usize, turbo: bool, mem: u8, ctrl: &Control) -> Option<Vec<u8>> {
+    let mut model = Predictor::new(n, turbo, mem);
     let mut dec = Decoder::new(payload);
     let mut out = Vec::with_capacity(n);
     let mut since_check = 0usize;
@@ -317,13 +376,18 @@ mod tests {
     /// segment size and profile are recovered from the payload, so decode
     /// needs no hint. Both model profiles are exercised.
     fn roundtrip_segmented(data: &[u8], seg: usize) {
-        for turbo in [false, true] {
+        for (turbo, mem) in [
+            (false, predictor::MEM_STD),
+            (true, predictor::MEM_STD),
+            (false, predictor::MEM_BIG),
+            (false, predictor::MEM_PLUS),
+        ] {
             let ctrl = Control::new();
-            let payload = encode_framed(data, seg, turbo, &ctrl).unwrap();
+            let payload = encode_framed(data, seg, turbo, mem, &ctrl).unwrap();
             let decoded = decode_framed(&payload, data.len(), &Control::new()).unwrap();
             assert_eq!(
                 decoded, data,
-                "segmented roundtrip mismatch (seg={seg}, turbo={turbo}, {} bytes)",
+                "segmented roundtrip mismatch (seg={seg}, turbo={turbo}, mem={mem}, {} bytes)",
                 data.len()
             );
         }
@@ -366,8 +430,8 @@ mod tests {
     fn segmentation_is_transparent_to_ratio() {
         let s = "compression test data ".repeat(2000);
         let c = Control::new();
-        let one = encode_framed(s.as_bytes(), s.len() + 1, false, &c).unwrap();
-        let many = encode_framed(s.as_bytes(), 4096, false, &Control::new()).unwrap();
+        let one = encode_framed(s.as_bytes(), s.len() + 1, false, 0, &c).unwrap();
+        let many = encode_framed(s.as_bytes(), 4096, false, 0, &Control::new()).unwrap();
         assert_eq!(decode_framed(&one, s.len(), &Control::new()).unwrap(), s.as_bytes());
         assert_eq!(decode_framed(&many, s.len(), &Control::new()).unwrap(), s.as_bytes());
     }

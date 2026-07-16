@@ -42,6 +42,11 @@ impl Encoder {
         }
     }
 
+    /// Bytes emitted so far (diagnostics).
+    pub fn out_len(&self) -> usize {
+        self.out.len()
+    }
+
     /// Flush the remaining state and return the encoded byte stream.
     pub fn finish(mut self) -> Vec<u8> {
         // Emit all four bytes of x1 so the decoder can reconstruct the final

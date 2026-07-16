@@ -1,22 +1,30 @@
 //! Top-level compress / decompress orchestration.
 //!
-//! ## File Format (VERSION 8)
+//! ## File Format (VERSION 9)
 //!
 //! ```text
 //! [0..4]                      magic: "CPGC"
-//! [4]                         version: 8
-//! [5]                         flags: bit0 = has_passthrough, bit1 = has_transforms
+//! [4]                         version: 9
+//! [5]                         flags: bit0 = has_passthrough, bit1 = has_transforms,
+//!                                    bit2 = text-dictionary transform applied
 //! [6..14]                     orig_len: u64 LE
 //! [14..18]                    crc32: u32 LE  (CRC-32 of the original bytes)
-//! [18..22]                    n_blocks: u32 LE  (= ceil(orig_len / WINDOW_SIZE))
-//! [22..22+n_blocks]           block_tags: one byte per block
+//! [18..26 if flags bit2]      stream_len: u64 LE (length of the dict-transformed
+//!                             stream; block accounting below uses this length)
+//! [next 4]                    n_blocks: u32 LE  (= ceil(stream_len / WINDOW_SIZE))
+//! [.. +n_blocks]              block_tags: one byte per block
 //!                               0x00 = context-mixed, no transform
 //!                               0x01–0x08 = context-mixed on transformed data (1-indexed into CANDIDATES)
 //!                               0xFF = passthrough (raw bytes, not run through the mixer)
-//! [22+n_blocks..26+n_blocks]  passthrough_len: u32 LE
-//! [26+n_blocks .. +passthrough_len]  raw bytes for passthrough blocks
+//! [next 4]                    passthrough_len: u32 LE
+//! [.. +passthrough_len]       raw bytes for passthrough blocks
 //! [rest]                      context-mixer payload for all non-passthrough blocks (in block order)
 //! ```
+//!
+//! When flags bit2 is set the entire input was first run through the
+//! adaptive word-dictionary transform ([`crate::transform::textdict`]); every
+//! later stage (classification, blocks, mixer) operates on that stream, and
+//! decoding inverts it as the final step before the CRC check.
 //!
 //! The CRC-32 is verified after decoding, so a corrupt archive — or one written
 //! by an incompatible model version — fails loudly instead of returning wrong
@@ -31,7 +39,7 @@ use crate::checksum::crc32;
 use crate::transform::search::{find_best_transform, CANDIDATES};
 
 const MAGIC: &[u8; 4] = b"CPGC";
-const VERSION: u8 = 8;
+const VERSION: u8 = 9;
 /// Smallest possible header: magic+ver+flags+orig_len+crc32+n_blocks+passthrough_len.
 const HEADER_MIN: usize = 4 + 1 + 1 + 8 + 4 + 4 + 4;
 const TAG_NORMAL: u8 = 0x00;
@@ -72,7 +80,25 @@ pub fn compress_with_progress(
 /// Compress with a shared [`cm::Control`] for pause/resume/cancel and a live
 /// byte counter (used by the GUI). Returns an error if the job is cancelled.
 pub fn compress_with_control(input: &[u8], level: u8, ctrl: &cm::Control) -> Result<Vec<u8>> {
-    let n = input.len();
+    // ------------------------------------------------------------------
+    // Step 0: whole-stream word-dictionary transform on texty input. All
+    // later stages see the transformed stream; the original length and CRC
+    // still describe the caller's bytes.
+    // ------------------------------------------------------------------
+    let orig_n = input.len();
+    // The dictionary transform pays off in the turbo profile (the reduced
+    // model recovers less of the structure the tokens erase, and the 40%
+    // stream shrinkage is a direct speedup). The full model extracts more
+    // from raw characters than from tokens, so levels >= 4 skip it.
+    let dict_stream = if level <= 3 {
+        crate::transform::textdict::apply(input)
+    } else {
+        None
+    };
+    let text_dict = dict_stream.is_some();
+    let stream: &[u8] = dict_stream.as_deref().unwrap_or(input);
+
+    let n = stream.len();
     let n_blocks = if n == 0 { 0usize } else { (n + WINDOW_SIZE - 1) / WINDOW_SIZE };
 
     // ------------------------------------------------------------------
@@ -84,12 +110,12 @@ pub fn compress_with_control(input: &[u8], level: u8, ctrl: &cm::Control) -> Res
     let mut block_transformed: Vec<Option<Vec<u8>>> = vec![None; n_blocks];
 
     if n > 0 {
-        let regions = classify(input);
+        let regions = classify(stream);
         for (block_idx, region) in regions.iter().enumerate() {
             if block_idx >= n_blocks { break; }
             let start = block_idx * WINDOW_SIZE;
             let end = (start + WINDOW_SIZE).min(n);
-            let chunk = &input[start..end];
+            let chunk = &stream[start..end];
 
             if region.passthrough {
                 // Passing incompressible data through guards against expansion
@@ -115,7 +141,7 @@ pub fn compress_with_control(input: &[u8], level: u8, ctrl: &cm::Control) -> Res
     for block_idx in 0..n_blocks {
         let start = block_idx * WINDOW_SIZE;
         let end = (start + WINDOW_SIZE).min(n);
-        let chunk = &input[start..end];
+        let chunk = &stream[start..end];
         let tag = block_tags[block_idx];
 
         if tag == TAG_PASSTHROUGH {
@@ -138,15 +164,19 @@ pub fn compress_with_control(input: &[u8], level: u8, ctrl: &cm::Control) -> Res
     // ------------------------------------------------------------------
     let flags: u8 =
         (if passthrough_data.is_empty() { 0u8 } else { 1u8 })
-        | (if block_tags.iter().any(|&t| t != TAG_NORMAL && t != TAG_PASSTHROUGH) { 2u8 } else { 0u8 });
+        | (if block_tags.iter().any(|&t| t != TAG_NORMAL && t != TAG_PASSTHROUGH) { 2u8 } else { 0u8 })
+        | (if text_dict { 4u8 } else { 0u8 });
 
-    let total = HEADER_MIN + n_blocks + passthrough_data.len() + ans_payload.len();
+    let total = HEADER_MIN + 8 + n_blocks + passthrough_data.len() + ans_payload.len();
     let mut out = Vec::with_capacity(total);
     out.extend_from_slice(MAGIC);
     out.push(VERSION);
     out.push(flags);
-    out.extend_from_slice(&(n as u64).to_le_bytes());
+    out.extend_from_slice(&(orig_n as u64).to_le_bytes());
     out.extend_from_slice(&crc32(input).to_le_bytes());
+    if text_dict {
+        out.extend_from_slice(&(n as u64).to_le_bytes());
+    }
     out.extend_from_slice(&(n_blocks as u32).to_le_bytes());
     out.extend_from_slice(&block_tags);
     out.extend_from_slice(&(passthrough_data.len() as u32).to_le_bytes());
@@ -180,16 +210,29 @@ pub fn decompress_with_control(input: &[u8], ctrl: &cm::Control) -> Result<Vec<u
             input[4], VERSION
         ));
     }
-    // input[5] = flags (reserved for decoder use; currently informational)
+    let flags = input[5];
+    let text_dict = flags & 4 != 0;
     let orig_len  = u64::from_le_bytes(input[6..14].try_into().unwrap()) as usize;
     let crc_expected = u32::from_le_bytes(input[14..18].try_into().unwrap());
-    let n_blocks  = u32::from_le_bytes(input[18..22].try_into().unwrap()) as usize;
+    // With the dictionary transform, block accounting runs on the length of
+    // the *transformed* stream, stored right after the CRC.
+    let mut off = 18usize;
+    let stream_len = if text_dict {
+        if input.len() < 26 + 4 {
+            return Err(anyhow!("truncated dict-transform header"));
+        }
+        off = 26;
+        u64::from_le_bytes(input[18..26].try_into().unwrap()) as usize
+    } else {
+        orig_len
+    };
+    let n_blocks  = u32::from_le_bytes(input[off..off + 4].try_into().unwrap()) as usize;
 
-    let tags_end = 22 + n_blocks;
+    let tags_end = off + 4 + n_blocks;
     if input.len() < tags_end + 4 {
         return Err(anyhow!("truncated block table"));
     }
-    let block_tags = &input[22..tags_end];
+    let block_tags = &input[off + 4..tags_end];
     let pt_len = u32::from_le_bytes(input[tags_end..tags_end + 4].try_into().unwrap()) as usize;
 
     let pt_start  = tags_end + 4;
@@ -214,7 +257,7 @@ pub fn decompress_with_control(input: &[u8], ctrl: &cm::Control) -> Result<Vec<u
         if tag == TAG_PASSTHROUGH { 0 }
         else {
             let start = i * WINDOW_SIZE;
-            (start + WINDOW_SIZE).min(orig_len) - start
+            (start + WINDOW_SIZE).min(stream_len) - start
         }
     }).sum();
 
@@ -226,15 +269,15 @@ pub fn decompress_with_control(input: &[u8], ctrl: &cm::Control) -> Result<Vec<u
     };
 
     // ------------------------------------------------------------------
-    // Reconstruct original byte order from block tags
+    // Reconstruct the coded stream's byte order from block tags
     // ------------------------------------------------------------------
-    let mut output = Vec::with_capacity(orig_len);
+    let mut output = Vec::with_capacity(stream_len);
     let mut ans_pos = 0usize;
     let mut pt_pos  = 0usize;
 
     for (block_idx, &tag) in block_tags.iter().enumerate() {
         let start     = block_idx * WINDOW_SIZE;
-        let block_len = (start + WINDOW_SIZE).min(orig_len) - start;
+        let block_len = (start + WINDOW_SIZE).min(stream_len) - start;
 
         if tag == TAG_PASSTHROUGH {
             if pt_pos + block_len > passthrough_data.len() {
@@ -262,6 +305,12 @@ pub fn decompress_with_control(input: &[u8], ctrl: &cm::Control) -> Result<Vec<u
             CANDIDATES[tag_idx].invert(&mut block);
             output.extend_from_slice(&block);
         }
+    }
+
+    // Invert the whole-stream dictionary transform, if it was applied.
+    if text_dict {
+        output = crate::transform::textdict::invert(&output)
+            .ok_or_else(|| anyhow!("corrupt word-dictionary stream"))?;
     }
 
     // Integrity check: a mismatch means the archive is corrupt or was written

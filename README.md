@@ -9,9 +9,11 @@ predictor feeding a binary arithmetic coder.
 > re-pointed at what the tool actually is. The acronym, the CLI name and the
 > `CPGC` magic bytes are unchanged.
 
-**Status: on general text it beats gzip, bzip2 and xz/LZMA on ratio.** It does
-not beat the heaviest research compressors (cmix/PAQ8), and on tiny files or
-already-dense binaries bzip2/xz can still edge it.
+**Status: on general text it beats gzip, bzip2, xz/LZMA, zstd, brotli and
+7-Zip's PPMd on ratio** — see the [enwik8 benchmark](#the-english-wikipedia-benchmark-enwik8)
+below, measured against the Large Text Compression Benchmark reference
+results. It does not beat the heaviest research compressors (zpaq/cmix/PAQ8),
+and on tiny files or already-dense binaries bzip2/xz can still edge it.
 
 ---
 
@@ -75,9 +77,29 @@ shared with the PAQ family, but the model below is specific to this codec):
   path when the CPU has it, with a scalar fallback that is bit-identical
   (every product fits i32 exactly; sums widen to i64), so archives decode
   across machines regardless of CPU features. No compile flags needed.
-- **Two model profiles** — levels 1–3 run a turbo roster (orders 2–5 + word,
-  two mixer views, two APMs) recorded as a byte in the payload; levels 4–9
-  run everything. Turbo is ~2.2x faster and still beats the classical tools.
+- **Indirect context models** — two models keyed by *the byte that followed
+  the same order-2/order-3 context last time* (v9). On natural-language text
+  "what came after this bigram before" is a sharper cue than the bigram
+  alone.
+- **Text contexts** — hashed order-8 and order-10 (Wikipedia markup repeats
+  at 8–12 byte scale, bridging order-7 and the match model) and a
+  case-folded order-3 that merges "The"/"the" statistics (v9).
+- **Model profiles** — levels 1–3 run a turbo roster (orders 2–5 + word,
+  two mixer views, two APMs), ~2.2x faster and still ahead of the classical
+  tools; levels 4–6 run the full 23-model roster; levels 7–9 add the
+  **big-memory profiles** (v9): hashed context tables up to 2^23–2^24
+  buckets and match tables up to 2^25 slots, sized from the segment length.
+  A 100 MB text segment has far more distinct order-4..7 contexts than the
+  standard tables can hold — before v9, eviction thrash was the single
+  biggest ratio cost on big files. The profile byte is recorded in the
+  payload, so decoding never depends on the level mapping.
+- **Adaptive word-dictionary transform** (v9, turbo levels) — texty inputs
+  are word-tokenized against a dictionary *mined from the input itself*
+  (no shipped dictionary, language-agnostic, exactly invertible; tokens are
+  built only from byte values unused in the input, so no escaping exists).
+  The stream shrinks ~40%, which is a direct CPU saving at the turbo levels.
+  The full model extracts more from raw characters than from tokens, so
+  levels ≥ 4 skip it.
 
 Every archive stores a **CRC-32 of the original bytes**, verified after
 decoding: a corrupt archive — or one written by an incompatible model version —
@@ -100,9 +122,83 @@ with cores — so on big archives CPGC-NX is not only smaller than xz but
 
 ---
 
+## The English Wikipedia benchmark (enwik8)
+
+[enwik8](https://mattmahoney.net/dc/textdata.html) — the first 100,000,000
+bytes of the English Wikipedia dump — is the test file of Matt Mahoney's
+[Large Text Compression Benchmark](https://mattmahoney.net/dc/text.html)
+(and the Hutter Prize), the long-running scoreboard for text compression.
+CPGC v9 measured against it, every archive decompressed and CRC-verified:
+
+![enwik8 compressed size vs other tools](benchmarks/enwik8_sizes.png)
+
+**20,078,377 bytes (1.606 bits/byte) at level 9** — smaller than every
+mainstream tool on the LTCB reference list: 19% smaller than xz -9e, 21%
+smaller than zstd -22, 22% smaller than brotli -q11, 5% smaller than 7-Zip's
+PPMd, and 4.4% smaller than CPGC v8. The compressors still ahead of it
+(zpaq, PAQ8, cmix, nncp) are research/archival engines that are one to three
+orders of magnitude slower — cmix takes multiple *days* on this file where
+CPGC takes 7 minutes on a 4-core container.
+
+### All nine levels, measured
+
+![CPGC level sweep on enwik8](benchmarks/enwik8_tradeoff.png)
+
+| level | compressed (bytes) | bits/byte | compress | decompress | round-trip |
+|--:|--:|--:|--:|--:|:--|
+| 1 | 23,537,940 | 1.883 | 31 s | 27 s | verified |
+| 2 | 22,741,152 | 1.819 | 30 s | 27 s | verified |
+| 3 | 22,070,944 | 1.766 | 31 s | 30 s | verified |
+| 4 | 21,075,392 | 1.686 | 121 s | 110 s | verified |
+| 5 | 20,693,974 | 1.656 | 143 s | 144 s | verified |
+| 6 | 20,522,500 | 1.642 | 142 s | 144 s | verified |
+| 7 | 20,131,832 | 1.611 | 399 s | 385 s | verified |
+| 8 | 20,078,377 | 1.606 | 425 s | 418 s | verified |
+| 9 | 20,078,377 | 1.606 | 422 s | 440 s | verified |
+
+(4-core container; levels 8 and 9 currently produce identical archives —
+9 is headroom. Turbo level 1 already beats xz -9e on this file while
+compressing faster than xz does on the same machine: 31 s vs 138 s.)
+
+For calibration against the LTCB table: this places CPGC between 7z-PPMd
+(21,197,559) and zpaq -m5 (17,855,729). The top of that table — cmix at
+14.6 MB, nncp at 14.9 MB — runs giant LSTM/transformer models; closing that
+gap honestly means shipping a neural predictor, which is on the roadmap
+below.
+
+### enwik9 — the current LTCB / Hutter Prize file
+
+The live ranking (and the 500,000€ [Hutter Prize](http://prize.hutter1.net/))
+is scored on **enwik9**, the first 10^9 bytes of the same dump. CPGC measured
+on it, every run decompressed and CRC-verified:
+
+![enwik9 compressed size vs other tools](benchmarks/enwik9_sizes.png)
+
+| level | compressed (bytes) | bits/byte | compress | decompress | round-trip |
+|--:|--:|--:|--:|--:|:--|
+| 1 | 205,742,664 | 1.646 | 5 min | 4 min | verified |
+| 3 | 192,130,481 | 1.537 | 4 min | 4 min | verified |
+| 5 | 178,844,027 | 1.431 | 17 min | 18 min | verified |
+| 9 | **172,426,003** | **1.379** | 38 min | 36 min | verified |
+
+(Same 4-core container; level 9 capped at 3 worker threads so three
+extra-large model instances fit in 15 GB of RAM.)
+
+**172,426,003 bytes at level 9** — 12.6% smaller than xz -9e, 20% smaller
+than zstd -22, and 3.7% smaller than 7-Zip's PPMd, the strongest of the
+mainstream tools on this file. bits/byte *improves* from 1.606 (enwik8) to
+1.379 at 10x the data — the per-segment models keep getting sharper — and
+the default level 5 already matches PPMd's best. On the LTCB ranking this
+sits between PPMd and zpaq, the same neighborhood as on enwik8; the entries
+above zpaq are all research CM/neural engines (paq8px ~4 days, cmix ~7 days
+on this file, versus 38 minutes here). The Hutter Prize record (~110 MB
+including the decompressor) remains firmly neural territory.
+
+---
+
 ## Measured results
 
-> **Note:** the reference table below predates the current (v8) engine. The
+> **Note:** the reference table below predates the current (v9) engine. The
 > lineage: v5 added count-adaptive counters, orders 0–7 and a two-layer
 > learned mixer; v6 added indirect bit-history models, a word-pair context, a
 > dual match model and a partial-byte mixer view + APM; v7 rebuilt the entire
@@ -110,8 +206,11 @@ with cores — so on big archives CPGC-NX is not only smaller than xz but
 > smaller *and* ~2.4x faster than v6 at once); v8 added a runtime-detected
 > AVX2 mixer (bit-exact with the scalar path), **two-speed coding** (long
 > verified matches are coded by a tiny match-confidence model, skipping the
-> whole mixer), and a **turbo profile** at levels 1–3. The figures below are
-> therefore conservative.
+> whole mixer), and a **turbo profile** at levels 1–3; v9 fixed a
+> **mixer-overflow collapse on segments larger than ~12 MiB** (levels 6–9 on
+> big files used to silently degrade to ~4.4 bits/byte), added the
+> big-memory profiles, indirect + high-order text contexts, and the
+> word-dictionary transform. The figures below are therefore conservative.
 >
 > Fresh v8 measurements on the current `corpus/` files (verified round-trips),
 > against every big-name tool at its maximum setting. Sizes in bytes, times
@@ -290,12 +389,19 @@ Register from a stable location: copy `cpgc.exe` somewhere permanent and run
 
 ## Compression levels
 
-`-l`/`--level` (1–9, default 5) trades speed for ratio by setting the parallel
-**segment size**: lower levels use smaller segments (more cores, faster, a
-little larger), higher levels use larger segments (better ratio, less
-parallelism). The size is recorded in the archive, so decompression never needs
-to know the level. Levels ≥ 5 also enable the transform pass. Example on 9 MB of
-text:
+`-l`/`--level` (1–9, default 5) trades speed and memory for ratio along three
+axes, all recorded in the archive so decompression never needs to know the
+level:
+
+- **Segment size** — lower levels use smaller parallel segments (more cores,
+  faster, a little larger), higher levels use larger segments.
+- **Model profile** — levels 1–3 run the turbo roster plus the
+  word-dictionary transform on text; levels 4–9 run the full model.
+- **Memory profile** — level 7 runs big tables (~1 GB per 64 MiB segment),
+  levels 8–9 run extra-large tables (~4 GB per 100 MB segment). If you don't
+  have the RAM for the top levels on huge files, use 5–7.
+
+Levels ≥ 5 also enable the transform pass. Example on 9 MB of text:
 
 | level | size | bits/byte | speed |
 |--:|--:|--:|--:|
@@ -430,6 +536,10 @@ Best LR: **0.01** → 3.43 bits/byte
 - [x] CRC-32 integrity check, verified on decode (rejects corrupt / incompatible archives)
 - [x] Count-adaptive counters + two-layer learned mixer (context orders 0–7)
 - [x] Windows right-click shell integration (`cpgc register` / `cpgc unregister`)
+- [x] Full enwik8 + enwik9 benchmark tables vs zstd / LZMA / brotli / PPMd (see above; charts in `benchmarks/`)
+- [x] Big-memory profiles (levels 7-9) + fix for the >12 MiB single-segment mixer collapse
+- [x] Indirect context models, order-8/order-10/case-folded text contexts
+- [x] Adaptive word-dictionary transform (turbo levels)
 - [ ] True int8 runtime inference (hot-path dequantize-on-the-fly for better L2 cache utilization)
 - [ ] LR decay schedule (0.9999 per byte as recommended in plan)
-- [ ] Full enwik8 benchmark table vs zstd / LZMA
+- [ ] Small online neural predictor as a mixer input (the road toward zpaq/paq8 territory on enwik)

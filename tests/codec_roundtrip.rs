@@ -65,10 +65,10 @@ fn codec_roundtrip_random_looking() {
 
 #[test]
 fn codec_header_magic_version() {
-    // "test" = 4 bytes → 1 block (VERSION 8 header layout)
+    // "test" = 4 bytes → 1 block (VERSION 9 header layout)
     let compressed = compress(b"test", 1).unwrap();
     assert_eq!(&compressed[0..4], b"CPGC", "magic bytes wrong");
-    assert_eq!(compressed[4], 8, "version should be 8");
+    assert_eq!(compressed[4], 9, "version should be 9");
     // flags at [5]; orig_len at [6..14]
     let len = u64::from_le_bytes(compressed[6..14].try_into().unwrap());
     assert_eq!(len, 4, "stored length wrong");
@@ -161,3 +161,26 @@ fn quantize_snapshot_lossless_near_zero() {
     }
 }
 
+
+#[test]
+fn codec_roundtrip_large_text_turbo_dict() {
+    // Large texty input at a turbo level exercises the whole-stream
+    // word-dictionary transform end to end (flag bit2 + inversion).
+    let para = "The free encyclopedia project grew rapidly in 2005, according to \
+                the [[English language]] article about data compression theory.\n";
+    let data: Vec<u8> = para.as_bytes().iter().cycle().take(300_000).cloned().collect();
+    let compressed = compress(&data, 2).expect("compress failed");
+    assert_eq!(compressed[5] & 4, 4, "dict transform should fire on big text");
+    let recovered = decompress(&compressed).expect("decompress failed");
+    assert_eq!(recovered, data);
+}
+
+#[test]
+fn codec_roundtrip_large_text_full_model() {
+    let para = "In information theory, data compression involves encoding data \
+                using fewer bits than the original representation would use.\n";
+    let data: Vec<u8> = para.as_bytes().iter().cycle().take(300_000).cloned().collect();
+    let compressed = compress(&data, 7).expect("compress failed");
+    let recovered = decompress(&compressed).expect("decompress failed");
+    assert_eq!(recovered, data);
+}
