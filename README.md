@@ -122,6 +122,52 @@ with cores — so on big archives CPGC-NX is not only smaller than xz but
 
 ---
 
+## The English Wikipedia benchmark (enwik8)
+
+[enwik8](https://mattmahoney.net/dc/textdata.html) — the first 100,000,000
+bytes of the English Wikipedia dump — is the test file of Matt Mahoney's
+[Large Text Compression Benchmark](https://mattmahoney.net/dc/text.html)
+(and the Hutter Prize), the long-running scoreboard for text compression.
+CPGC v9 measured against it, every archive decompressed and CRC-verified:
+
+![enwik8 compressed size vs other tools](benchmarks/enwik8_sizes.png)
+
+**20,078,377 bytes (1.606 bits/byte) at level 9** — smaller than every
+mainstream tool on the LTCB reference list: 19% smaller than xz -9e, 21%
+smaller than zstd -22, 22% smaller than brotli -q11, 5% smaller than 7-Zip's
+PPMd, and 4.4% smaller than CPGC v8. The compressors still ahead of it
+(zpaq, PAQ8, cmix, nncp) are research/archival engines that are one to three
+orders of magnitude slower — cmix takes multiple *days* on this file where
+CPGC takes 7 minutes on a 4-core container.
+
+### All nine levels, measured
+
+![CPGC level sweep on enwik8](benchmarks/enwik8_tradeoff.png)
+
+| level | compressed (bytes) | bits/byte | compress | decompress | round-trip |
+|--:|--:|--:|--:|--:|:--|
+| 1 | 23,537,940 | 1.883 | 31 s | 27 s | verified |
+| 2 | 22,741,152 | 1.819 | 30 s | 27 s | verified |
+| 3 | 22,070,944 | 1.766 | 31 s | 30 s | verified |
+| 4 | 21,075,392 | 1.686 | 121 s | 110 s | verified |
+| 5 | 20,693,974 | 1.656 | 143 s | 144 s | verified |
+| 6 | 20,522,500 | 1.642 | 142 s | 144 s | verified |
+| 7 | 20,131,832 | 1.611 | 399 s | 385 s | verified |
+| 8 | 20,078,377 | 1.606 | 425 s | 418 s | verified |
+| 9 | 20,078,377 | 1.606 | 422 s | 440 s | verified |
+
+(4-core container; levels 8 and 9 currently produce identical archives —
+9 is headroom. Turbo level 1 already beats xz -9e on this file while
+compressing faster than xz does on the same machine: 31 s vs 138 s.)
+
+For calibration against the LTCB table: this places CPGC between 7z-PPMd
+(21,197,559) and zpaq -m5 (17,855,729). The top of that table — cmix at
+14.6 MB, nncp at 14.9 MB — runs giant LSTM/transformer models; closing that
+gap honestly means shipping a neural predictor, which is on the roadmap
+below.
+
+---
+
 ## Measured results
 
 > **Note:** the reference table below predates the current (v9) engine. The
@@ -462,6 +508,10 @@ Best LR: **0.01** → 3.43 bits/byte
 - [x] CRC-32 integrity check, verified on decode (rejects corrupt / incompatible archives)
 - [x] Count-adaptive counters + two-layer learned mixer (context orders 0–7)
 - [x] Windows right-click shell integration (`cpgc register` / `cpgc unregister`)
+- [x] Full enwik8 benchmark table vs zstd / LZMA / brotli / PPMd (see above; charts in `benchmarks/`)
+- [x] Big-memory profiles (levels 7-9) + fix for the >12 MiB single-segment mixer collapse
+- [x] Indirect context models, order-8/order-10/case-folded text contexts
+- [x] Adaptive word-dictionary transform (turbo levels)
 - [ ] True int8 runtime inference (hot-path dequantize-on-the-fly for better L2 cache utilization)
 - [ ] LR decay schedule (0.9999 per byte as recommended in plan)
-- [ ] Full enwik8 benchmark table vs zstd / LZMA
+- [ ] Small online neural predictor as a mixer input (the road toward zpaq/paq8 territory on enwik)
