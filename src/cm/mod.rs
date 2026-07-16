@@ -114,9 +114,13 @@ pub const SEG_SIZE: usize = 16 << 20; // 16 MiB == level 5
 /// Map a 1–9 compression level to a segment size.
 ///
 /// Lower levels use smaller segments: more parallelism (faster) at a small
-/// ratio cost. Higher levels use larger segments: better ratio, less
-/// parallelism. The chosen size is stored in the payload, so decoding never
+/// ratio cost. The chosen size is stored in the payload, so decoding never
 /// depends on this mapping.
+///
+/// Segments cap at 64 MiB: measured on enwik8, a monolithic 100 MB segment
+/// compresses *worse* than two 50 MB segments even with double-size tables
+/// (text is nonstationary, and hashed-table pressure grows with the window),
+/// so past level 7 the ratio lever is the memory profile, not the window.
 pub fn seg_size_for_level(level: u8) -> usize {
     let bits: u32 = match level {
         0 | 1 => 20, // 1 MiB
@@ -125,9 +129,7 @@ pub fn seg_size_for_level(level: u8) -> usize {
         4 => 23,
         5 => 24, // 16 MiB (default)
         6 => 25,
-        7 => 26,
-        8 => 27,
-        _ => 28, // 256 MiB
+        _ => 26, // 64 MiB (levels 7-9)
     };
     1usize << bits
 }
