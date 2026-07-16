@@ -198,3 +198,77 @@ for lv, size, ct, dt in levels:
     print(
         f"| {lv} | {size:,} | {size * 8 / 1e8:.3f} | {ct:.0f} s | {dt:.0f} s | ✓ |"
     )
+
+# ---------------------------------------------------------------------------
+# Chart 3 (optional): enwik9 — rendered only when enwik9_results.csv exists
+# ---------------------------------------------------------------------------
+e9_csv = os.path.join(HERE, "enwik9_results.csv")
+if os.path.exists(e9_csv):
+    e9 = {}
+    with open(e9_csv) as f:
+        for r in csv.DictReader(f):
+            e9[r["mode"]] = r
+
+    LTCB9 = [
+        ("gzip -9", 322_591_995, "classic"),
+        ("bzip2 -9", 253_977_839, "classic"),
+        ("brotli -q11", 223_597_884, "classic"),
+        ("zstd -22", 215_674_670, "classic"),
+        ("xz -9e", 197_331_816, "classic"),
+        ("7z PPMd", 178_965_454, "classic"),
+        ("zpaq -m5", 142_252_605, "research"),
+        ("paq8px", 126_486_867, "research"),
+        ("cmix v21", 107_963_380, "research"),
+        ("nncp v3.2", 106_632_363, "research"),
+    ]
+
+    best9 = e9["cpgc-9"]
+    assert best9["verified"] == "1", "enwik9 -9 failed round-trip verification!"
+    entries9 = [("CPGC v9 -9 (this repo)", int(best9["comp_bytes"]), "cpgc")]
+    entries9 += LTCB9
+    entries9.sort(key=lambda e: e[1], reverse=True)
+
+    fig, ax = plt.subplots(figsize=(8.6, 5.6), dpi=160)
+    names = [e[0] for e in entries9]
+    sizes = [e[1] / 1e6 for e in entries9]
+    bar_colors = [colors[e[2]] for e in entries9]
+    ax.barh(range(len(entries9)), sizes, height=0.62, color=bar_colors, zorder=3)
+    ax.set_yticks(range(len(entries9)), names)
+    for i, e in enumerate(entries9):
+        weight = "bold" if e[2] == "cpgc" else "normal"
+        ink = PRIMARY if e[2] == "cpgc" else SECONDARY
+        ax.text(sizes[i] + 3, i, f"{e[1]:,}",
+                va="center", fontsize=8.5, color=ink, fontweight=weight)
+        ax.get_yticklabels()[i].set_fontweight(weight)
+        ax.get_yticklabels()[i].set_color(ink)
+    ax.invert_yaxis()
+    ax.set_xlim(0, 380)
+    ax.set_xlabel("compressed size of enwik9 (MB) — smaller is better", fontsize=9)
+    ax.xaxis.set_major_locator(MultipleLocator(50))
+    ax.grid(axis="x", color=GRID, linewidth=0.8, zorder=0)
+    ax.spines[["top", "right", "left"]].set_visible(False)
+    ax.tick_params(axis="y", length=0, labelsize=9)
+    ax.tick_params(axis="x", labelsize=8)
+    ax.set_title(
+        "enwik9 (1 GB English Wikipedia) — compressed size",
+        fontsize=11, fontweight="bold", loc="left", pad=14, color=PRIMARY,
+    )
+    ax.text(
+        0, 1.015,
+        "the current LTCB / Hutter Prize file · reference sizes from mattmahoney.net/dc/text.html",
+        transform=ax.transAxes, fontsize=7.5, color=MUTED,
+    )
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT, "enwik9_sizes.png"))
+    print("wrote enwik9_sizes.png")
+
+    print()
+    print("| level | compressed (bytes) | bpb | compress | decompress | verified |")
+    print("|--:|--:|--:|--:|--:|:--|")
+    for lv in (1, 3, 5, 9):
+        key = f"cpgc-{lv}"
+        if key in e9:
+            r = e9[key]
+            size, ct, dt = int(r["comp_bytes"]), float(r["comp_seconds"]), float(r["decomp_seconds"])
+            mark = "✓" if r["verified"] == "1" else "FAILED"
+            print(f"| {lv} | {size:,} | {size * 8 / 1e9:.3f} | {ct/60:.0f} min | {dt/60:.0f} min | {mark} |")
