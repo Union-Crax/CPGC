@@ -166,6 +166,34 @@ For calibration against the LTCB table: this places CPGC between 7z-PPMd
 gap honestly means shipping a neural predictor, which is on the roadmap
 below.
 
+### enwik9 — the current LTCB / Hutter Prize file
+
+The live ranking (and the 500,000€ [Hutter Prize](http://prize.hutter1.net/))
+is scored on **enwik9**, the first 10^9 bytes of the same dump. CPGC measured
+on it, every run decompressed and CRC-verified:
+
+![enwik9 compressed size vs other tools](benchmarks/enwik9_sizes.png)
+
+| level | compressed (bytes) | bits/byte | compress | decompress | round-trip |
+|--:|--:|--:|--:|--:|:--|
+| 1 | 205,742,664 | 1.646 | 5 min | 4 min | verified |
+| 3 | 192,130,481 | 1.537 | 4 min | 4 min | verified |
+| 5 | 178,844,027 | 1.431 | 17 min | 18 min | verified |
+| 9 | **172,426,003** | **1.379** | 38 min | 36 min | verified |
+
+(Same 4-core container; level 9 capped at 3 worker threads so three
+extra-large model instances fit in 15 GB of RAM.)
+
+**172,426,003 bytes at level 9** — 12.6% smaller than xz -9e, 20% smaller
+than zstd -22, and 3.7% smaller than 7-Zip's PPMd, the strongest of the
+mainstream tools on this file. bits/byte *improves* from 1.606 (enwik8) to
+1.379 at 10x the data — the per-segment models keep getting sharper — and
+the default level 5 already matches PPMd's best. On the LTCB ranking this
+sits between PPMd and zpaq, the same neighborhood as on enwik8; the entries
+above zpaq are all research CM/neural engines (paq8px ~4 days, cmix ~7 days
+on this file, versus 38 minutes here). The Hutter Prize record (~110 MB
+including the decompressor) remains firmly neural territory.
+
 ---
 
 ## Measured results
@@ -508,7 +536,7 @@ Best LR: **0.01** → 3.43 bits/byte
 - [x] CRC-32 integrity check, verified on decode (rejects corrupt / incompatible archives)
 - [x] Count-adaptive counters + two-layer learned mixer (context orders 0–7)
 - [x] Windows right-click shell integration (`cpgc register` / `cpgc unregister`)
-- [x] Full enwik8 benchmark table vs zstd / LZMA / brotli / PPMd (see above; charts in `benchmarks/`)
+- [x] Full enwik8 + enwik9 benchmark tables vs zstd / LZMA / brotli / PPMd (see above; charts in `benchmarks/`)
 - [x] Big-memory profiles (levels 7-9) + fix for the >12 MiB single-segment mixer collapse
 - [x] Indirect context models, order-8/order-10/case-folded text contexts
 - [x] Adaptive word-dictionary transform (turbo levels)
