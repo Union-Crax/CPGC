@@ -146,32 +146,63 @@ Registration is per-user under `HKCU` and does not require administrator
 rights. It adds compression actions for files and folders plus open, extract,
 and test actions for `.cpgc` and `.cpas` archives.
 
-## Benchmarks
-
-The checked-in benchmark runs use the 100 MB `enwik8` and 1 GB `enwik9`
-Wikipedia corpora. Every reported run was decompressed and verified. Times are
-from the same four-core test environment and should be treated as comparative,
-not universal.
+## The English Wikipedia benchmarks
 
 ### enwik8
 
-| Mode | Compressed size | Bits/byte | Compress | Decompress |
-|---|---:|---:|---:|---:|
-| CPGC level 1 | 23,537,940 B | 1.883 | 31.1 s | 27.4 s |
-| CPGC level 5 | 20,693,974 B | 1.656 | 142.6 s | 143.5 s |
-| CPGC level 9 | **20,078,377 B** | **1.606** | 422.3 s | 439.5 s |
-| xz `-9e` | 24,831,656 B | 1.987 | 138.2 s | 1.9 s |
-| bzip2 `-9` | 29,008,758 B | 2.321 | 8.1 s | 4.4 s |
-| gzip `-9` | 36,445,248 B | 2.916 | 6.2 s | 0.8 s |
+[enwik8](https://mattmahoney.net/dc/textdata.html) is the first 100,000,000
+bytes of the English Wikipedia dump and a standard text-compression benchmark.
+Every CPGC v9 archive below was decompressed and CRC-verified.
+
+![enwik8 compressed size vs other tools](benchmarks/enwik8_sizes.png)
+
+At level 9, CPGC produces **20,078,377 bytes (1.606 bits/byte)**. That is 19%
+smaller than xz `-9e`, 21% smaller than zstd `-22`, 22% smaller than brotli
+`-q11`, 5% smaller than 7-Zip's PPMd, and 4.4% smaller than CPGC v8. Research
+compressors such as zpaq, PAQ8, cmix, and nncp still achieve better ratios, at
+substantially higher runtime cost.
+
+#### All nine levels
+
+![CPGC level sweep on enwik8](benchmarks/enwik8_tradeoff.png)
+
+| Level | Compressed size | Bits/byte | Compress | Decompress | Round-trip |
+|---:|---:|---:|---:|---:|:---|
+| 1 | 23,537,940 B | 1.883 | 31 s | 27 s | Verified |
+| 2 | 22,741,152 B | 1.819 | 30 s | 27 s | Verified |
+| 3 | 22,070,944 B | 1.766 | 31 s | 30 s | Verified |
+| 4 | 21,075,392 B | 1.686 | 121 s | 110 s | Verified |
+| 5 | 20,693,974 B | 1.656 | 143 s | 144 s | Verified |
+| 6 | 20,522,500 B | 1.642 | 142 s | 144 s | Verified |
+| 7 | 20,131,832 B | 1.611 | 399 s | 385 s | Verified |
+| 8 | 20,078,377 B | 1.606 | 425 s | 418 s | Verified |
+| 9 | **20,078,377 B** | **1.606** | 422 s | 440 s | Verified |
+
+These measurements used a four-core container. Levels 8 and 9 currently
+produce identical archives. Turbo level 1 compressed faster than xz `-9e` in
+this environment (31 seconds versus 138 seconds) while producing a smaller
+archive.
 
 ### enwik9
 
-| Level | Compressed size | Bits/byte | Compress | Decompress |
-|---:|---:|---:|---:|---:|
-| 1 | 205,742,664 B | 1.646 | 4.7 min | 4.3 min |
-| 3 | 192,130,481 B | 1.537 | 4.5 min | 4.3 min |
-| 5 | 178,844,027 B | 1.431 | 17.0 min | 17.8 min |
-| 9 | **172,426,003 B** | **1.379** | 38.1 min | 35.6 min |
+[enwik9](https://mattmahoney.net/dc/textdata.html) is the first 1,000,000,000
+bytes of the same dump and is used by the Large Text Compression Benchmark and
+the Hutter Prize. Every run was decompressed and CRC-verified.
+
+![enwik9 compressed size vs other tools](benchmarks/enwik9_sizes.png)
+
+| Level | Compressed size | Bits/byte | Compress | Decompress | Round-trip |
+|---:|---:|---:|---:|---:|:---|
+| 1 | 205,742,664 B | 1.646 | 5 min | 4 min | Verified |
+| 3 | 192,130,481 B | 1.537 | 4 min | 4 min | Verified |
+| 5 | 178,844,027 B | 1.431 | 17 min | 18 min | Verified |
+| 9 | **172,426,003 B** | **1.379** | 38 min | 36 min | Verified |
+
+These measurements used the same four-core container. The level 9 run was
+capped at three workers so the extra-large models fit within 15 GB of RAM. Its
+172,426,003-byte output is 12.6% smaller than xz `-9e`, 20% smaller than zstd
+`-22`, and 3.7% smaller than 7-Zip's PPMd on the reference ranking. The default
+level 5 also slightly beats PPMd's best reported size.
 
 Full measurements and chart-generation scripts are in [`benchmarks/`](benchmarks/):
 
