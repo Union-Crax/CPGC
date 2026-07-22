@@ -388,8 +388,16 @@ fn char_class(b: u8) -> usize {
     }
 }
 
-// Mixer learning rate (scales the coding-error gradient applied to weights).
-const MIX_LR: i32 = 3;
+// Mixer learning rate (scales the coding-error gradient applied to weights),
+// chosen per profile. The full profile runs large segments (8-64 MiB) where a
+// smaller rate converges to sharper weights; turbo runs small segments (1-4
+// MiB) that never reach that regime, so it keeps the faster rate that adapts
+// within a short window. The rate is not stored in the archive: it is a fixed
+// function of the profile, which the payload header already records.
+const MIX_LR_FULL: i32 = 3;
+const MIX_LR_TURBO: i32 = 5;
+// Upper bound of the two, used only to size the SIMD-equivalence test's range.
+const MIX_LR: i32 = MIX_LR_TURBO;
 // First-layer weight clamp. ±2^19 at 16 fractional bits (gain ±8) keeps every
 // weight-input product inside i32, which the AVX2 mixer path relies on.
 const W_CLAMP: i32 = (1 << 19) - 1;
@@ -554,6 +562,7 @@ pub struct Predictor {
     pending_hs: [u32; NBH],      // low-nibble hashes, prefetched a bit early
     nbh: usize,                  // active model count (NBH_TURBO or NBH)
     turbo: bool,                 // reduced mixer/SSE roster for low levels
+    mix_lr: i32,                 // mixer learning rate (per profile)
 
     // Partial byte: starts at 1, accumulates coded bits.
     c0: u32,
@@ -665,6 +674,7 @@ impl Predictor {
             bh_sm: vec![sm_init(); nbh],
             nbh,
             turbo,
+            mix_lr: if turbo { MIX_LR_TURBO } else { MIX_LR_FULL },
             bh_base: [0; NBH],
             bh_off: [1; NBH],
             bh_state: [0; NBH],
@@ -945,7 +955,7 @@ impl Predictor {
         self.nib_path = (self.nib_path << 1) | (bit as u32);
 
         // First-layer weights: gradient step on coding error for all views.
-        let err = ((bit << 12) - self.pr) * MIX_LR;
+        let err = ((bit << 12) - self.pr) * self.mix_lr;
         let avx2 = self.use_avx2;
         Self::train(&mut self.wa, self.ctx_a, &self.tx, err, avx2);
         if !self.turbo {
