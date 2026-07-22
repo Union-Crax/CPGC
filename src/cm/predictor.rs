@@ -24,11 +24,12 @@
 //!   hash is preferred so seeds start from more reliable anchors — and the
 //!   predictor forecasts the *bit* of the historical continuation with
 //!   confidence that grows with verified match length.
-//! * **Two-layer logistic mixer.** A first layer holds four independently
-//!   context-selected weight vectors (by previous byte, by the byte before it,
-//!   by match-length bucket, and by the partial byte being decoded); a small
-//!   learned second layer selected by (match length, bit position) combines
-//!   their stretched outputs, trained online by gradient descent.
+//! * **Two-layer logistic mixer.** A first layer holds five independently
+//!   context-selected weight vectors (by previous byte, by a hashed order-3
+//!   context, by match-length bucket, by the partial byte being decoded, and
+//!   by a hashed order-6 context); a small learned second layer selected by
+//!   (previous-byte class, match length, bit position) combines their
+//!   stretched outputs, trained online by gradient descent.
 //! * **Chained SSE.** Four adaptive probability maps (keyed by partial byte,
 //!   previous bytes, and an order-3 hash) refine the result before the binary
 //!   arithmetic coder.
@@ -60,7 +61,7 @@ const MATCH_EMPTY: u32 = u32::MAX;
 
 // Two-speed coding: once a verified match reaches this length, whole bytes
 // are coded by a tiny adaptive match-confidence model instead of the full
-// 18-model mixer — the byte is almost certainly the match continuation, so
+// 25-model mixer — the byte is almost certainly the match continuation, so
 // the heavy machinery would only sharpen an already near-certain prediction.
 // The switch depends only on match_len, which encoder and decoder track in
 // lockstep, so it is perfectly deterministic.
@@ -309,8 +310,8 @@ const NSTRIDE: usize = STRIDES.len();
 const NHASH: usize = 8;
 const NSPARSE: usize = 6;
 const NIND: usize = 2;
-const NTEXT: usize = 3; // order-8, order-10, case-folded order-3
-const NBH: usize = NHASH + NSPARSE + NSTRIDE + NIND + NTEXT; // 23 bit-history models
+const NTEXT: usize = 5; // order-8, order-10, order-12, order-16, case-folded order-3
+const NBH: usize = NHASH + NSPARSE + NSTRIDE + NIND + NTEXT; // 25 bit-history models
 
 // Per-model table kind, indexed like `bh_base`: how big a hash table the
 // model's context population deserves.
@@ -330,6 +331,7 @@ const MODEL_KIND: [Kind; NBH] = [
     Kind::Stride, Kind::Stride, Kind::Stride, Kind::Stride,
     Kind::Ind, Kind::Ind,
     Kind::Hash, Kind::Hash,                         // orders 8, 10
+    Kind::Hash, Kind::Hash,                         // orders 12, 16
     Kind::Hash,                                     // case-folded order-3
 ];
 // The turbo profile (levels 1-3) runs only the first NBH_TURBO models
@@ -351,20 +353,43 @@ const MATCH_IN: usize = BH_IN + NBH * 2;
 const BIAS_IN: usize = NIN - 1;
 
 // First-layer weight-set row counts. The `wc` view is selected by a hashed
-// order-2 context (2048 rows) rather than the single previous-previous byte:
-// on text, which pair of bytes precedes the position is a far sharper cue
-// for which models to trust than either byte alone.
-const WC_ROWS: usize = 2048;
+// order-3 context rather than the single previous-previous byte: on text,
+// which short run of bytes precedes the position is a far sharper cue for
+// which models to trust than any single byte. More rows let the mixer keep
+// distinct weight vectors for many more distinct local contexts; on big text
+// each row still sees ample training traffic.
+const WC_ROWS: usize = 8192;
+// Row count for the fifth first-layer view (`we`), selected by a hashed
+// order-6 context.
+const WE_ROWS: usize = 8192;
 
-// Second-layer mixer: combines the four first-layer outputs plus a bias.
-const NMIX: usize = 5;
-// Selected by (is-text flag, min(match_len, 7), bit position): the combiner
-// learns, e.g., to trust the match view less on low bits and counter views
-// more there — with separate weights inside words vs elsewhere.
-const NMIX_CTX: usize = 128;
+// Second-layer mixer: combines the five first-layer outputs plus a bias.
+const NMIX: usize = 6;
+// Selected by (previous-byte class, min(match_len, 7), bit position): the
+// combiner learns, e.g., to trust the match view less on low bits and counter
+// views more there — with separate weights per character class (letter, space,
+// digit, other), which on text is a sharper predictor of which views to trust
+// than a single in-word flag.
+const NMIX_CTX: usize = 256;
+
+/// Coarse character class of a byte, used to select second-layer mixer weights:
+/// 0 = ASCII letter, 1 = space/tab/newline, 2 = ASCII digit, 3 = everything
+/// else (punctuation, markup, high bytes).
+#[inline]
+fn char_class(b: u8) -> usize {
+    if b.is_ascii_alphabetic() {
+        0
+    } else if b == b' ' || b == b'\n' || b == b'\t' || b == b'\r' {
+        1
+    } else if b.is_ascii_digit() {
+        2
+    } else {
+        3
+    }
+}
 
 // Mixer learning rate (scales the coding-error gradient applied to weights).
-const MIX_LR: i32 = 5;
+const MIX_LR: i32 = 3;
 // First-layer weight clamp. ±2^19 at 16 fractional bits (gain ±8) keeps every
 // weight-input product inside i32, which the AVX2 mixer path relies on.
 const W_CLAMP: i32 = (1 << 19) - 1;
@@ -552,19 +577,21 @@ pub struct Predictor {
     fast_idx: usize,
     fast_p: [u16; 256],
 
-    // First-layer mixer: four context-selected weight sets.
+    // First-layer mixer: five context-selected weight sets.
     wa: Vec<i32>, // [256][NINP] selected by previous byte
     wb: Vec<i32>, // [64][NINP]  selected by match-length bucket
-    wc: Vec<i32>, // [256][NINP] selected by the byte before previous
+    wc: Vec<i32>, // [WC_ROWS][NINP] selected by a hashed order-3 context
     wd: Vec<i32>, // [256][NINP] selected by the partial byte (c0)
+    we: Vec<i32>, // [WE_ROWS][NINP] selected by a hashed order-6 context
     tx: [i32; NINP],
     use_avx2: bool, // AVX2 detected at runtime (paths are bit-identical)
     ctx_a: usize,
     ctx_b: usize,
     ctx_c: usize,
     ctx_d: usize,
+    ctx_e: usize,
 
-    // Second-layer mixer: combines the four first-layer outputs.
+    // Second-layer mixer: combines the five first-layer outputs.
     wf: Vec<i32>, // [NMIX_CTX][NMIX]
     mi: [i32; NMIX],
     ctx_f: usize,
@@ -602,9 +629,9 @@ impl Predictor {
         let ind3_bits: u32 = if mem >= MEM_BIG { 22 } else { 20 };
 
         // Initialise the second-layer weights so the mixer starts out close to
-        // an average of its active view inputs (two in turbo, four in full);
+        // an average of its active view inputs (two in turbo, five in full);
         // gradient descent refines from there.
-        let views = if turbo { 2 } else { 4 };
+        let views = if turbo { 2 } else { 5 };
         let avg_w = ((1i64 << 16) / views) as i32;
         let mut wf = vec![0i32; NMIX_CTX * NMIX];
         for c in 0..NMIX_CTX {
@@ -669,6 +696,7 @@ impl Predictor {
             wb: vec![0i32; 64 * NINP],
             wc: vec![0i32; WC_ROWS * NINP],
             wd: vec![0i32; 256 * NINP],
+            we: vec![0i32; WE_ROWS * NINP],
             tx: [0; NINP],
             #[cfg(target_arch = "x86_64")]
             use_avx2: std::arch::is_x86_feature_detected!("avx2"),
@@ -678,6 +706,7 @@ impl Predictor {
             ctx_b: 0,
             ctx_c: 0,
             ctx_d: 0,
+            ctx_e: 0,
             wf,
             mi: [0; NMIX],
             ctx_f: 0,
@@ -789,8 +818,9 @@ impl Predictor {
         self.tx[BIAS_IN] = 256;
 
         // --- first-layer mixing: context-selected weight sets -------------
-        // (turbo runs only the prev-byte and partial-byte views; ctx_c is a
-        // hashed order-2 selection, computed once per byte in next_byte)
+        // (turbo runs only the prev-byte and partial-byte views; ctx_c and
+        // ctx_e are hashed order-3 / order-6 selections, computed once per
+        // byte in next_byte)
         self.ctx_a = self.hist[0] as usize;
         self.ctx_b = (self.match_len.min(63)) as usize;
         self.ctx_d = (c0 & 0xff) as usize;
@@ -803,20 +833,21 @@ impl Predictor {
         const S_CLAMP: i32 = 1 << 15;
         let sa = self.dot(&self.wa, self.ctx_a).clamp(-S_CLAMP, S_CLAMP);
         let sd = self.dot(&self.wd, self.ctx_d).clamp(-S_CLAMP, S_CLAMP);
-        let (sb, sc) = if self.turbo {
-            (0, 0)
+        let (sb, sc, se) = if self.turbo {
+            (0, 0, 0)
         } else {
             (
                 self.dot(&self.wb, self.ctx_b).clamp(-S_CLAMP, S_CLAMP),
                 self.dot(&self.wc, self.ctx_c).clamp(-S_CLAMP, S_CLAMP),
+                self.dot(&self.we, self.ctx_e).clamp(-S_CLAMP, S_CLAMP),
             )
         };
 
         // --- second-layer mixing: a small learned combiner ---------------
-        self.mi = [sa, sb, sc, sd, 256];
+        self.mi = [sa, sb, sc, sd, se, 256];
         let bits_seen = (31 - c0.leading_zeros()) as usize; // 0..7
-        let in_word = self.hist[0].is_ascii_alphabetic() as usize;
-        self.ctx_f = in_word << 6 | (self.match_len.min(7) as usize) << 3 | bits_seen;
+        let cls = char_class(self.hist[0]);
+        self.ctx_f = cls << 6 | (self.match_len.min(7) as usize) << 3 | bits_seen;
         let mixed = self.dot2(self.ctx_f);
         self.pr = squash(mixed);
 
@@ -920,6 +951,7 @@ impl Predictor {
         if !self.turbo {
             Self::train(&mut self.wb, self.ctx_b, &self.tx, err, avx2);
             Self::train(&mut self.wc, self.ctx_c, &self.tx, err, avx2);
+            Self::train(&mut self.we, self.ctx_e, &self.tx, err, avx2);
         }
         Self::train(&mut self.wd, self.ctx_d, &self.tx, err, avx2);
 
@@ -1122,16 +1154,26 @@ impl Predictor {
             let text_base = ind_base + NIND;
             self.bh_base[text_base] = hash_ctx(&self.hist[0..8], 8);
             self.bh_base[text_base + 1] = hash_ctx(&self.hist[0..10], 10);
+            // Very high orders bridge medium-range statistical structure
+            // (repeated phrases, markup runs) that lies between order-10 and
+            // the exact-match model — the mixer trusts them only where they
+            // have evidence, so an empty high-order context costs nothing.
+            self.bh_base[text_base + 2] = hash_ctx(&self.hist[0..12], 12);
+            self.bh_base[text_base + 3] = hash_ctx(&self.hist[0..16], 16);
             let folded = [
                 self.hist[0] | 0x20,
                 self.hist[1] | 0x20,
                 self.hist[2] | 0x20,
             ];
-            self.bh_base[text_base + 2] = hash_ctx(&folded, 67);
+            self.bh_base[text_base + 4] = hash_ctx(&folded, 67);
         }
 
-        // First-layer `wc` selection: hashed order-2, fixed for the byte.
-        self.ctx_c = (hash_ctx(&self.hist[0..2], 61) as usize) & (WC_ROWS - 1);
+        // First-layer `wc` / `we` selections: hashed order-3 and order-6,
+        // fixed for the byte. The order-6 view lets the combiner trust a
+        // different blend of models where a long local context is decisive
+        // (repeated markup, boilerplate) than in generic order-3 contexts.
+        self.ctx_c = (hash_ctx(&self.hist[0..3], 61) as usize) & (WC_ROWS - 1);
+        self.ctx_e = (hash_ctx(&self.hist[0..6], 71) as usize) & (WE_ROWS - 1);
 
         // High-nibble bucket addresses are now known; start their lines early
         // (pointless when the next byte takes the fast path).
