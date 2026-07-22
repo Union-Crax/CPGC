@@ -152,13 +152,13 @@ and test actions for `.cpgc` and `.cpas` archives.
 
 [enwik8](https://mattmahoney.net/dc/textdata.html) is the first 100,000,000
 bytes of the English Wikipedia dump and a standard text-compression benchmark.
-Every CPGC v9 archive below was decompressed and CRC-verified.
+Every CPGC v10 archive below was decompressed and CRC-verified.
 
 ![enwik8 compressed size vs other tools](benchmarks/enwik8_sizes.png)
 
-At level 9, CPGC produces **20,078,377 bytes (1.606 bits/byte)**. That is 19%
-smaller than xz `-9e`, 21% smaller than zstd `-22`, 22% smaller than brotli
-`-q11`, 5% smaller than 7-Zip's PPMd, and 4.4% smaller than CPGC v8. Research
+At level 9, CPGC produces **19,320,647 bytes (1.546 bits/byte)**. That is 22%
+smaller than xz `-9e`, 24% smaller than zstd `-22`, 25% smaller than brotli
+`-q11`, 9% smaller than 7-Zip's PPMd, and 3.8% smaller than CPGC v9. Research
 compressors such as zpaq, PAQ8, cmix, and nncp still achieve better ratios, at
 substantially higher runtime cost.
 
@@ -168,19 +168,19 @@ substantially higher runtime cost.
 
 | Level | Compressed size | Bits/byte | Compress | Decompress | Round-trip |
 |---:|---:|---:|---:|---:|:---|
-| 1 | 23,537,940 B | 1.883 | 31 s | 27 s | Verified |
-| 2 | 22,741,152 B | 1.819 | 30 s | 27 s | Verified |
-| 3 | 22,070,944 B | 1.766 | 31 s | 30 s | Verified |
-| 4 | 21,075,392 B | 1.686 | 121 s | 110 s | Verified |
-| 5 | 20,693,974 B | 1.656 | 143 s | 144 s | Verified |
-| 6 | 20,522,500 B | 1.642 | 142 s | 144 s | Verified |
-| 7 | 20,131,832 B | 1.611 | 399 s | 385 s | Verified |
-| 8 | 20,078,377 B | 1.606 | 425 s | 418 s | Verified |
-| 9 | **20,078,377 B** | **1.606** | 422 s | 440 s | Verified |
+| 1 | 23,544,702 B | 1.884 | 27 s | 26 s | Verified |
+| 2 | 22,735,441 B | 1.819 | 28 s | 25 s | Verified |
+| 3 | 22,068,868 B | 1.766 | 30 s | 29 s | Verified |
+| 4 | 20,903,387 B | 1.672 | 113 s | 115 s | Verified |
+| 5 | 20,471,793 B | 1.638 | 149 s | 155 s | Verified |
+| 6 | 20,203,405 B | 1.616 | 156 s | 173 s | Verified |
+| 7 | 19,382,850 B | 1.551 | 358 s | 357 s | Verified |
+| 8 | 19,320,647 B | 1.546 | 380 s | 380 s | Verified |
+| 9 | **19,320,647 B** | **1.546** | 379 s | 376 s | Verified |
 
 These measurements used a four-core container. Levels 8 and 9 currently
 produce identical archives. Turbo level 1 compressed faster than xz `-9e` in
-this environment (31 seconds versus 138 seconds) while producing a smaller
+this environment (27 seconds versus 138 seconds) while producing a smaller
 archive.
 
 ### enwik9
@@ -214,7 +214,7 @@ Full measurements and chart-generation scripts are in [`benchmarks/`](benchmarks
 ## Project status
 
 CPGC is experimental and its archive format is still evolving. The current
-decoder accepts format version 9 archives; retain a matching binary for older
+decoder accepts format version 10 archives; retain a matching binary for older
 archives. For important data, keep an independent copy and use `cpgc verify`
 after compression.
 
