@@ -193,16 +193,17 @@ the Hutter Prize. Every run was decompressed and CRC-verified.
 
 | Level | Compressed size | Bits/byte | Compress | Decompress | Round-trip |
 |---:|---:|---:|---:|---:|:---|
-| 1 | 205,742,664 B | 1.646 | 5 min | 4 min | Verified |
-| 3 | 192,130,481 B | 1.537 | 4 min | 4 min | Verified |
-| 5 | 178,844,027 B | 1.431 | 17 min | 18 min | Verified |
-| 9 | **172,426,003 B** | **1.379** | 38 min | 36 min | Verified |
+| 1 | 205,675,118 B | 1.645 | 4 min | 4 min | Verified |
+| 3 | 192,017,370 B | 1.536 | 4 min | 4 min | Verified |
+| 5 | 176,815,015 B | 1.415 | 18 min | 19 min | Verified |
+| 9 | **165,237,676 B** | **1.322** | 35 min | 33 min | Verified |
 
 These measurements used the same four-core container. The level 9 run was
 capped at three workers so the extra-large models fit within 15 GB of RAM. Its
-172,426,003-byte output is 12.6% smaller than xz `-9e`, 20% smaller than zstd
-`-22`, and 3.7% smaller than 7-Zip's PPMd on the reference ranking. The default
-level 5 also slightly beats PPMd's best reported size.
+165,237,676-byte output is 16.3% smaller than xz `-9e`, 23% smaller than zstd
+`-22`, and 7.7% smaller than 7-Zip's PPMd on the reference ranking, and 4.2%
+smaller than CPGC v9. The default level 5 also comfortably beats PPMd's best
+reported size.
 
 Full measurements and chart-generation scripts are in [`benchmarks/`](benchmarks/):
 
