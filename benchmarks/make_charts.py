@@ -77,13 +77,10 @@ LTCB = [
     ("paq8px", 16_046_995),
     ("cmix v21", 14_623_723),
 ]
-V10_BASELINE = ("CPGC v10 (old)", 19_320_647)
-
 # ---------------------------------------------------------------------------
-# Chart 1: compressed size, CPGC v11 vs the field (horizontal bars, sorted)
+# Chart 1: compressed size, CPGC vs the field (horizontal bars, sorted)
 # ---------------------------------------------------------------------------
-entries = [("CPGC v11 -9 (this repo)", best[1], "cpgc")]
-entries.append((V10_BASELINE[0], V10_BASELINE[1], "old"))
+entries = [("CPGC -9 (this repo)", best[1], "cpgc")]
 for name, size in LTCB:
     kind = "research" if name in ("zpaq -m5", "paq8px", "cmix v21") else "classic"
     entries.append((name, size, kind))
@@ -179,7 +176,7 @@ ax.grid(color=GRID, linewidth=0.8, zorder=0)
 ax.spines[["top", "right"]].set_visible(False)
 ax.tick_params(labelsize=8)
 ax.set_title(
-    "CPGC v11 levels 1-9 on enwik8 — size vs compress time",
+    "CPGC levels 1-9 on enwik8 — size vs compress time",
     fontsize=11, fontweight="bold", loc="left", pad=14, color=PRIMARY,
 )
 ax.text(
@@ -224,7 +221,7 @@ if os.path.exists(e9_csv):
 
     best9 = e9["cpgc-9"]
     assert best9["verified"] == "1", "enwik9 -9 failed round-trip verification!"
-    entries9 = [("CPGC v11 -9 (this repo)", int(best9["comp_bytes"]), "cpgc")]
+    entries9 = [("CPGC -9 (this repo)", int(best9["comp_bytes"]), "cpgc")]
     entries9 += LTCB9
     entries9.sort(key=lambda e: e[1], reverse=True)
 

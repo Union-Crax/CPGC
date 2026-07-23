@@ -1,30 +1,24 @@
 # CPGC
 
-CPGC is an experimental, lossless general-purpose compressor built around the
-**CPGC-NX** bit-level context-mixing engine. It includes a command-line tool, a
-native desktop archive browser, solid directory archives, parallel compression,
-and CRC-32 verification.
+CPGC is an experimental, lossless compressor built on the **CPGC-NX** bit-level
+context-mixing engine. It trades speed for ratio on text — it is not a
+replacement for zstd or gzip when latency matters. It ships as a command-line
+tool and a native archive-browser GUI, supports single-file `.cpgc` and solid
+multi-file archives, and CRC-32-verifies every archive it decodes.
 
-CPGC is optimized for compression ratio, especially on text. It is not intended
-to replace fast codecs such as zstd or gzip when latency is the main concern.
+## How it works
 
-## Highlights
+The engine predicts each bit from ~26 context models — hashed byte contexts
+(orders 2–16), word and word-pair models, sparse and stride contexts, indirect
+models, and a long-match model — combined by a two-layer logistic mixer and
+sharpened by a chained SSE stage before a binary arithmetic coder. Encoder and
+decoder update the same model in lockstep, so no model state is stored in the
+archive; it records only the segment size and model profile, so a file decodes
+identically regardless of the machine's CPU count or SIMD support.
 
-- Bit-level context mixing with hashed byte, word, sparse, stride, indirect,
-  and long-match models
-- Online two-layer logistic mixer, adaptive probability maps, and a binary
-  arithmetic coder
-- Parallel independent segments for large inputs
-- Turbo profiles at levels 1–3 and larger-memory profiles at levels 7–9
-- Adaptive text dictionary and reversible structured-data transforms
-- Detection and passthrough of incompressible regions
-- Single-file `.cpgc` and solid multi-file archive support
-- Native GUI and optional Windows Explorer integration
-- CRC-32 verification on every decoded archive
-
-The encoder and decoder update the same model in lockstep, so model state is not
-stored in the archive. The archive records its segment and model profile, making
-decoding independent of the machine's CPU count and SIMD support.
+Large inputs are split into independent segments for parallel compression,
+incompressible regions are detected and stored raw, and texty input can pass
+through an adaptive word dictionary or reversible structured-data transforms.
 
 ## Install
 
@@ -150,60 +144,51 @@ and test actions for `.cpgc` and `.cpas` archives.
 
 ### enwik8
 
-[enwik8](https://mattmahoney.net/dc/textdata.html) is the first 100,000,000
-bytes of the English Wikipedia dump and a standard text-compression benchmark.
-Every CPGC v11 archive below was decompressed and CRC-verified.
+[enwik8](https://mattmahoney.net/dc/textdata.html) is the first 100 MB of the
+English Wikipedia dump, a standard text-compression benchmark. At level 9 CPGC
+compresses it to **19,178,089 bytes (1.534 bpc)** — smaller than every
+general-purpose codec below; the research compressors zpaq, PAQ8, and cmix
+still lead. Every archive was round-trip decompressed and CRC-verified.
 
 ![enwik8 compressed size vs other tools](benchmarks/enwik8_sizes.png)
 
-At level 9, CPGC produces **19,178,089 bytes (1.534 bits/byte)**. That is 22%
-smaller than xz `-9e`, 24% smaller than zstd `-22`, 25% smaller than brotli
-`-q11`, 9.5% smaller than 7-Zip's PPMd, and 4.5% smaller than the original
-CPGC v9 (0.7% beyond v10). Research compressors such as zpaq, PAQ8, cmix, and
-nncp still achieve better ratios, at substantially higher runtime cost.
-
-#### All nine levels
+The nine levels trade compress time for ratio:
 
 ![CPGC level sweep on enwik8](benchmarks/enwik8_tradeoff.png)
 
-| Level | Compressed size | Bits/byte | Compress | Decompress | Round-trip |
-|---:|---:|---:|---:|---:|:---|
-| 1 | 23,539,435 B | 1.883 | 28 s | 25 s | Verified |
-| 2 | 22,743,019 B | 1.819 | 28 s | 25 s | Verified |
-| 3 | 22,065,155 B | 1.765 | 29 s | 28 s | Verified |
-| 4 | 20,818,067 B | 1.665 | 123 s | 126 s | Verified |
-| 5 | 20,388,399 B | 1.631 | 161 s | 164 s | Verified |
-| 6 | 20,140,482 B | 1.611 | 162 s | 164 s | Verified |
-| 7 | 19,249,638 B | 1.540 | 376 s | 367 s | Verified |
-| 8 | 19,178,089 B | 1.534 | 423 s | 415 s | Verified |
-| 9 | **19,178,089 B** | **1.534** | 410 s | 438 s | Verified |
+| Level | Compressed size | Bits/byte | Compress | Decompress |
+|---:|---:|---:|---:|---:|
+| 1 | 23,539,435 B | 1.883 | 28 s | 25 s |
+| 2 | 22,743,019 B | 1.819 | 28 s | 25 s |
+| 3 | 22,065,155 B | 1.765 | 29 s | 28 s |
+| 4 | 20,818,067 B | 1.665 | 123 s | 126 s |
+| 5 | 20,388,399 B | 1.631 | 161 s | 164 s |
+| 6 | 20,140,482 B | 1.611 | 162 s | 164 s |
+| 7 | 19,249,638 B | 1.540 | 376 s | 367 s |
+| 8 | 19,178,089 B | 1.534 | 423 s | 415 s |
+| 9 | **19,178,089 B** | **1.534** | 410 s | 438 s |
 
-These measurements used a four-core container. Levels 8 and 9 currently
-produce identical archives. Turbo level 1 compressed faster than xz `-9e` in
-this environment (27 seconds versus 138 seconds) while producing a smaller
-archive.
+Measured on a four-core container. Levels 8 and 9 currently produce identical
+archives.
 
 ### enwik9
 
-[enwik9](https://mattmahoney.net/dc/textdata.html) is the first 1,000,000,000
-bytes of the same dump and is used by the Large Text Compression Benchmark and
-the Hutter Prize. Every run was decompressed and CRC-verified.
+[enwik9](https://mattmahoney.net/dc/textdata.html) is the first 1 GB of the same
+dump — the Large Text Compression Benchmark and Hutter Prize file. At level 9
+CPGC reaches **163,890,252 bytes (1.311 bpc)**. Every archive was round-trip
+decompressed and CRC-verified.
 
 ![enwik9 compressed size vs other tools](benchmarks/enwik9_sizes.png)
 
-| Level | Compressed size | Bits/byte | Compress | Decompress | Round-trip |
-|---:|---:|---:|---:|---:|:---|
-| 1 | 205,675,118 B | 1.645 | 5 min | 4 min | Verified |
-| 3 | 192,017,370 B | 1.536 | 4 min | 4 min | Verified |
-| 5 | 176,029,194 B | 1.408 | 21 min | 22 min | Verified |
-| 9 | **163,890,252 B** | **1.311** | 39 min | 40 min | Verified |
+| Level | Compressed size | Bits/byte | Compress | Decompress |
+|---:|---:|---:|---:|---:|
+| 1 | 205,675,118 B | 1.645 | 5 min | 4 min |
+| 3 | 192,017,370 B | 1.536 | 4 min | 4 min |
+| 5 | 176,029,194 B | 1.408 | 21 min | 22 min |
+| 9 | **163,890,252 B** | **1.311** | 39 min | 40 min |
 
-These measurements used the same four-core container. The level 9 run was
-capped at three workers so the extra-large models fit within 15 GB of RAM. Its
-163,890,252-byte output is 16.9% smaller than xz `-9e`, 24% smaller than zstd
-`-22`, and 8.4% smaller than 7-Zip's PPMd on the reference ranking, and 4.9%
-smaller than CPGC v9. The default level 5 also comfortably beats PPMd's best
-reported size.
+Same four-core container; level 9 was capped at three workers to fit its models
+within 15 GB of RAM.
 
 Full measurements and chart-generation scripts are in [`benchmarks/`](benchmarks/):
 
