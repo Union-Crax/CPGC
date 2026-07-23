@@ -152,15 +152,15 @@ and test actions for `.cpgc` and `.cpas` archives.
 
 [enwik8](https://mattmahoney.net/dc/textdata.html) is the first 100,000,000
 bytes of the English Wikipedia dump and a standard text-compression benchmark.
-Every CPGC v10 archive below was decompressed and CRC-verified.
+Every CPGC v11 archive below was decompressed and CRC-verified.
 
 ![enwik8 compressed size vs other tools](benchmarks/enwik8_sizes.png)
 
-At level 9, CPGC produces **19,320,647 bytes (1.546 bits/byte)**. That is 22%
+At level 9, CPGC produces **19,178,089 bytes (1.534 bits/byte)**. That is 22%
 smaller than xz `-9e`, 24% smaller than zstd `-22`, 25% smaller than brotli
-`-q11`, 9% smaller than 7-Zip's PPMd, and 3.8% smaller than CPGC v9. Research
-compressors such as zpaq, PAQ8, cmix, and nncp still achieve better ratios, at
-substantially higher runtime cost.
+`-q11`, 9.5% smaller than 7-Zip's PPMd, and 4.5% smaller than the original
+CPGC v9 (0.7% beyond v10). Research compressors such as zpaq, PAQ8, cmix, and
+nncp still achieve better ratios, at substantially higher runtime cost.
 
 #### All nine levels
 
@@ -175,8 +175,8 @@ substantially higher runtime cost.
 | 5 | 20,471,793 B | 1.638 | 149 s | 155 s | Verified |
 | 6 | 20,203,405 B | 1.616 | 156 s | 173 s | Verified |
 | 7 | 19,382,850 B | 1.551 | 358 s | 357 s | Verified |
-| 8 | 19,320,647 B | 1.546 | 380 s | 380 s | Verified |
-| 9 | **19,320,647 B** | **1.546** | 379 s | 376 s | Verified |
+| 8 | 19,178,089 B | 1.534 | 391 s | 409 s | Verified |
+| 9 | **19,178,089 B** | **1.534** | 409 s | 415 s | Verified |
 
 These measurements used a four-core container. Levels 8 and 9 currently
 produce identical archives. Turbo level 1 compressed faster than xz `-9e` in
@@ -215,7 +215,7 @@ Full measurements and chart-generation scripts are in [`benchmarks/`](benchmarks
 ## Project status
 
 CPGC is experimental and its archive format is still evolving. The current
-decoder accepts format version 10 archives; retain a matching binary for older
+decoder accepts format version 11 archives; retain a matching binary for older
 archives. For important data, keep an independent copy and use `cpgc verify`
 after compression.
 
