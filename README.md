@@ -168,15 +168,15 @@ nncp still achieve better ratios, at substantially higher runtime cost.
 
 | Level | Compressed size | Bits/byte | Compress | Decompress | Round-trip |
 |---:|---:|---:|---:|---:|:---|
-| 1 | 23,544,702 B | 1.884 | 27 s | 26 s | Verified |
-| 2 | 22,735,441 B | 1.819 | 28 s | 25 s | Verified |
-| 3 | 22,068,868 B | 1.766 | 30 s | 29 s | Verified |
-| 4 | 20,903,387 B | 1.672 | 113 s | 115 s | Verified |
-| 5 | 20,471,793 B | 1.638 | 149 s | 155 s | Verified |
-| 6 | 20,203,405 B | 1.616 | 156 s | 173 s | Verified |
-| 7 | 19,382,850 B | 1.551 | 358 s | 357 s | Verified |
-| 8 | 19,178,089 B | 1.534 | 391 s | 409 s | Verified |
-| 9 | **19,178,089 B** | **1.534** | 409 s | 415 s | Verified |
+| 1 | 23,539,435 B | 1.883 | 28 s | 25 s | Verified |
+| 2 | 22,743,019 B | 1.819 | 28 s | 25 s | Verified |
+| 3 | 22,065,155 B | 1.765 | 29 s | 28 s | Verified |
+| 4 | 20,818,067 B | 1.665 | 123 s | 126 s | Verified |
+| 5 | 20,388,399 B | 1.631 | 161 s | 164 s | Verified |
+| 6 | 20,140,482 B | 1.611 | 162 s | 164 s | Verified |
+| 7 | 19,249,638 B | 1.540 | 376 s | 367 s | Verified |
+| 8 | 19,178,089 B | 1.534 | 423 s | 415 s | Verified |
+| 9 | **19,178,089 B** | **1.534** | 410 s | 438 s | Verified |
 
 These measurements used a four-core container. Levels 8 and 9 currently
 produce identical archives. Turbo level 1 compressed faster than xz `-9e` in
