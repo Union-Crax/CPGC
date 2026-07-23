@@ -33,8 +33,9 @@
 //!   descent.
 //! * **Chained SSE.** Four adaptive probability maps in an increasing-order
 //!   ladder (keyed by the partial byte, an order-2 context, an order-3 hash,
-//!   and an order-6 hash) refine the result before the binary arithmetic
-//!   coder.
+//!   and an order-6 hash), each nudging the running estimate a quarter of the
+//!   way toward its calibrated value, refine the result before the binary
+//!   arithmetic coder.
 //! * **Two-speed coding.** Bytes deep inside a verified match (>= FAST_LEN)
 //!   are coded by a tiny match-confidence SSE instead of the full model —
 //!   deterministically, since both sides track the match length — making
@@ -527,8 +528,8 @@ impl Apm {
         let target = bit << 16;
         let lo = self.t[self.base] as i32;
         let hi = self.t[self.base + 1] as i32;
-        self.t[self.base] = (lo + (((target - lo) * (128 - self.w)) >> 14)) as u16;
-        self.t[self.base + 1] = (hi + (((target - hi) * self.w) >> 14)) as u16;
+        self.t[self.base] = (lo + (((target - lo) * (128 - self.w)) >> 13)) as u16;
+        self.t[self.base + 1] = (hi + (((target - hi) * self.w) >> 13)) as u16;
     }
 }
 
@@ -881,20 +882,20 @@ impl Predictor {
 
         // --- SSE refinement (turbo keeps apm0 + apm2 only) ----------------
         let p0 = self.apm0.refine(self.pr, self.ctx_d);
-        let mut p = (self.pr + p0 * 3) >> 2;
+        let mut p = (self.pr * 3 + p0) >> 2;
         if !self.turbo {
             let o2 = ((self.hist[0] as usize) << 8) | self.hist[1] as usize;
             let p1 = self.apm1.refine(p, o2);
-            p = (p + p1 * 3) >> 2;
+            p = (p * 3 + p1) >> 2;
         }
         let p2 = self.apm2.refine(p, (self.bh_base[1] & 0x3fff) as usize);
-        p = (p + p2 * 3) >> 2;
+        p = (p * 3 + p2) >> 2;
         if !self.turbo {
             // Keyed by the order-6 context so this stage calibrates on a
             // longer context than apm2's order-3 hash, rather than duplicating
             // it.
             let p3 = self.apm3.refine(p, self.ctx_e);
-            p = (p + p3 * 3) >> 2;
+            p = (p * 3 + p3) >> 2;
         }
         self.final_pr = p.clamp(1, 4095);
         self.final_pr
