@@ -1,5 +1,8 @@
 #define MyAppName    "CPGC"
+; Overridable from the command line with ISCC /DMyAppVersion=...
+#ifndef MyAppVersion
 #define MyAppVersion "0.1.0"
+#endif
 #define MyAppPublisher "CPGC Project"
 #define MyAppURL     "https://github.com/Union-Crax/CPGC"
 #define MyAppExeName "cpgc-gui.exe"
@@ -15,16 +18,13 @@ AppUpdatesURL={#MyAppURL}
 DefaultDirName={autopf}\CPGC
 DefaultGroupName=CPGC
 AllowNoIcons=yes
-OutputDir=installer\Output
+OutputDir=Output
 OutputBaseFilename=CPGC-Setup
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-
-; Source tree root (two levels up from this .iss file inside installer\)
-#define SourcePath "{#SourcePath}..\"
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -34,10 +34,13 @@ Name: "desktopicon";     Description: "{cm:CreateDesktopIcon}"; GroupDescription
 Name: "addtopath";       Description: "Add install directory to user PATH"; GroupDescription: "Shell integration:"; Flags: unchecked
 Name: "shellintegration"; Description: "Add right-click context menu (Compress / Open / Extract / Test)"; GroupDescription: "Shell integration:"
 
+; Paths are relative to this .iss file's directory (installer\), so "..\" is
+; the repository root. Inno resolves relative Source paths against SourceDir,
+; which defaults to the script's directory.
 [Files]
-Source: "{#SourcePath}target\release\cpgc-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourcePath}target\release\cpgc.exe";     DestDir: "{app}"; Flags: ignoreversion
-Source: "{#SourcePath}README.md";                   DestDir: "{app}"; Flags: ignoreversion isreadme
+Source: "..\target\release\cpgc-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release\cpgc.exe";     DestDir: "{app}"; Flags: ignoreversion
+Source: "..\README.md";                   DestDir: "{app}"; Flags: ignoreversion isreadme
 
 [Icons]
 Name: "{group}\CPGC File Manager"; Filename: "{app}\{#MyAppExeName}"
