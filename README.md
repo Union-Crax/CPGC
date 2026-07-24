@@ -146,7 +146,7 @@ and test actions for `.cpgc` and `.cpas` archives.
 
 [enwik8](https://mattmahoney.net/dc/textdata.html) is the first 100 MB of the
 English Wikipedia dump, a standard text-compression benchmark. At level 9 CPGC
-compresses it to **19,178,089 bytes (1.534 bpc)** — smaller than every
+compresses it to **19,063,181 bytes (1.525 bpc)** — smaller than every
 general-purpose codec below; the research compressors zpaq, PAQ8, and cmix
 still lead. Every archive was round-trip decompressed and CRC-verified.
 
@@ -158,15 +158,15 @@ The nine levels trade compress time for ratio:
 
 | Level | Compressed size | Bits/byte | Compress | Decompress |
 |---:|---:|---:|---:|---:|
-| 1 | 23,539,435 B | 1.883 | 28 s | 25 s |
-| 2 | 22,743,019 B | 1.819 | 28 s | 25 s |
-| 3 | 22,065,155 B | 1.765 | 29 s | 28 s |
-| 4 | 20,818,067 B | 1.665 | 123 s | 126 s |
-| 5 | 20,388,399 B | 1.631 | 161 s | 164 s |
-| 6 | 20,140,482 B | 1.611 | 162 s | 164 s |
-| 7 | 19,249,638 B | 1.540 | 376 s | 367 s |
-| 8 | 19,178,089 B | 1.534 | 423 s | 415 s |
-| 9 | **19,178,089 B** | **1.534** | 410 s | 438 s |
+| 1 | 23,550,663 B | 1.884 | 35 s | 26 s |
+| 2 | 22,735,488 B | 1.819 | 27 s | 26 s |
+| 3 | 22,062,171 B | 1.765 | 31 s | 30 s |
+| 4 | 20,693,361 B | 1.655 | 132 s | 130 s |
+| 5 | 20,260,065 B | 1.621 | 168 s | 168 s |
+| 6 | 20,020,887 B | 1.602 | 168 s | 168 s |
+| 7 | 19,132,174 B | 1.531 | 396 s | 403 s |
+| 8 | 19,063,181 B | 1.525 | 450 s | 443 s |
+| 9 | **19,063,181 B** | **1.525** | 434 s | 446 s |
 
 Measured on a four-core container. Levels 8 and 9 currently produce identical
 archives.
@@ -175,17 +175,17 @@ archives.
 
 [enwik9](https://mattmahoney.net/dc/textdata.html) is the first 1 GB of the same
 dump — the Large Text Compression Benchmark and Hutter Prize file. At level 9
-CPGC reaches **163,890,252 bytes (1.311 bpc)**. Every archive was round-trip
+CPGC reaches **162,750,488 bytes (1.302 bpc)**. Every archive was round-trip
 decompressed and CRC-verified.
 
 ![enwik9 compressed size vs other tools](benchmarks/enwik9_sizes.png)
 
 | Level | Compressed size | Bits/byte | Compress | Decompress |
 |---:|---:|---:|---:|---:|
-| 1 | 205,675,118 B | 1.645 | 5 min | 4 min |
-| 3 | 192,017,370 B | 1.536 | 4 min | 4 min |
-| 5 | 176,029,194 B | 1.408 | 21 min | 22 min |
-| 9 | **163,890,252 B** | **1.311** | 39 min | 40 min |
+| 1 | 205,709,828 B | 1.646 | 5 min | 4 min |
+| 3 | 191,988,449 B | 1.536 | 4 min | 4 min |
+| 5 | 174,851,769 B | 1.399 | 19 min | 19 min |
+| 9 | **162,750,488 B** | **1.302** | 33 min | 34 min |
 
 Same four-core container; level 9 was capped at three workers to fit its models
 within 15 GB of RAM.
@@ -200,7 +200,7 @@ Full measurements and chart-generation scripts are in [`benchmarks/`](benchmarks
 ## Project status
 
 CPGC is experimental and its archive format is still evolving. The current
-decoder accepts format version 11 archives; retain a matching binary for older
+decoder accepts format version 12 archives; retain a matching binary for older
 archives. For important data, keep an independent copy and use `cpgc verify`
 after compression.
 
