@@ -62,7 +62,7 @@ for lv in range(1, 10):
         (lv, int(r["comp_bytes"]), float(r["comp_seconds"]), float(r["decomp_seconds"]))
     )
 
-# Headline: level 9 (max). Levels 8 and 9 produce identical archives today.
+# Headline: level 9 — the whole file in one segment, the engine's best ratio.
 best = levels[8]
 
 # LTCB published enwik8 figures (mattmahoney.net/dc/text.html) for context.
@@ -262,7 +262,7 @@ if os.path.exists(e9_csv):
     print()
     print("| level | compressed (bytes) | bpb | compress | decompress | verified |")
     print("|--:|--:|--:|--:|--:|:--|")
-    for lv in (1, 3, 5, 9):
+    for lv in (1, 3, 5, 8, 9):
         key = f"cpgc-{lv}"
         if key in e9:
             r = e9[key]
