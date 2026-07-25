@@ -29,3 +29,6 @@ dev.md
 /dist/
 /installer/Output/
 bench_data/
+
+# Intermediate benchmark output, merged into enwik9_results.csv when a run completes
+benchmarks/enwik9_[abc].csv
