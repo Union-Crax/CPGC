@@ -161,8 +161,8 @@ and test actions for `.cpgc` and `.cpas` archives.
 ### enwik8
 
 [enwik8](https://mattmahoney.net/dc/textdata.html) is the first 100 MB of the
-English Wikipedia dump, a standard text-compression benchmark. At level 9 CPGC
-compresses it to **19,063,181 bytes (1.525 bpc)** — smaller than every
+English Wikipedia dump, a standard text-compression benchmark. CPGC's best
+result on it is level 8's **18,535,007 bytes (1.483 bpc)** — smaller than every
 general-purpose codec below; the research compressors zpaq, PAQ8, and cmix
 still lead. Every archive was round-trip decompressed and CRC-verified.
 
@@ -174,18 +174,24 @@ The nine levels trade compress time for ratio:
 
 | Level | Compressed size | Bits/byte | Compress | Decompress |
 |---:|---:|---:|---:|---:|
-| 1 | 23,550,663 B | 1.884 | 35 s | 26 s |
-| 2 | 22,735,488 B | 1.819 | 27 s | 26 s |
-| 3 | 22,062,171 B | 1.765 | 31 s | 30 s |
-| 4 | 20,693,361 B | 1.655 | 132 s | 130 s |
-| 5 | 20,260,065 B | 1.621 | 168 s | 168 s |
-| 6 | 20,020,887 B | 1.602 | 168 s | 168 s |
-| 7 | 19,132,174 B | 1.531 | 396 s | 403 s |
-| 8 | 19,063,181 B | 1.525 | 450 s | 443 s |
-| 9 | **19,063,181 B** | **1.525** | 434 s | 446 s |
+| 1 | 23,531,756 B | 1.883 | 29 s | 28 s |
+| 2 | 22,720,026 B | 1.818 | 30 s | 28 s |
+| 3 | 22,037,386 B | 1.763 | 32 s | 31 s |
+| 4 | 20,445,942 B | 1.636 | 153 s | 148 s |
+| 5 | 20,016,786 B | 1.601 | 192 s | 196 s |
+| 6 | 19,712,978 B | 1.577 | 192 s | 194 s |
+| 7 | 18,671,295 B | 1.494 | 458 s | 463 s |
+| 8 | **18,535,007 B** | **1.483** | 521 s | 529 s |
+| 9 | 18,543,919 B | 1.484 | 769 s | 781 s |
 
-Measured on a four-core container. Levels 8 and 9 currently produce identical
-archives.
+Measured on a four-core container.
+
+enwik8 is small enough that level 9's single segment barely widens the window:
+level 8 already covers the file in two segments, so level 9 gains 33 MB of extra
+history and gives back about as much to table pressure. The two land within
+0.05% of each other, and level 9 costs 48% more time because it cannot use more
+than one core. Level 9 is for inputs large enough that level 8 would split them
+many times over — see enwik9 below.
 
 ### enwik9
 

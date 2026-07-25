@@ -62,8 +62,10 @@ for lv in range(1, 10):
         (lv, int(r["comp_bytes"]), float(r["comp_seconds"]), float(r["decomp_seconds"]))
     )
 
-# Headline: level 9 — the whole file in one segment, the engine's best ratio.
-best = levels[8]
+# Headline: whichever level actually came out smallest. On a file this size
+# that is level 8 — level 9's single segment only pays off on much larger
+# inputs, where level 8 would split many times over.
+best = min(levels, key=lambda t: t[1])
 
 # LTCB published enwik8 figures (mattmahoney.net/dc/text.html) for context.
 LTCB = [
@@ -80,7 +82,7 @@ LTCB = [
 # ---------------------------------------------------------------------------
 # Chart 1: compressed size, CPGC vs the field (horizontal bars, sorted)
 # ---------------------------------------------------------------------------
-entries = [("CPGC -9 (this repo)", best[1], "cpgc")]
+entries = [(f"CPGC -{best[0]} (this repo)", best[1], "cpgc")]
 for name, size in LTCB:
     kind = "research" if name in ("zpaq -m5", "paq8px", "cmix v21") else "classic"
     entries.append((name, size, kind))
