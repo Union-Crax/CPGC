@@ -10,6 +10,10 @@ default = []
 # Place weights at src/predictor/pretrained.bin then:
 #   cargo build --release --features pretrained
 pretrained = []
+# Expose model hyper-parameters as CPGC_* environment overrides so variants can
+# be A/B-measured from one build. Off in release: the defaults below are the
+# shipped model, and the bitstream must not depend on the environment.
+tune = []
 # Native desktop GUI (cpgc-gui binary).
 # Build with: cargo build --release --features gui --bin cpgc-gui
 gui = ["dep:eframe"]

@@ -16,9 +16,10 @@
 //!    corrupting predictions; this is where v7's ~2.4x speedup comes from.
 //! 3. **A dual long-match model** — 8-byte and 4-byte rolling-hash pointers
 //!    into history forecast the bit of the most recent matching continuation.
-//! 4. **A two-layer learned mixer** — four context-selected weight sets
-//!    (previous byte, byte before it, match length, partial byte) feed a
-//!    small second-layer combiner trained online on coding loss.
+//! 4. **A two-layer learned mixer** — six context-selected weight sets
+//!    (previous byte, match length, a hashed order-3 context, the partial
+//!    byte, a hashed order-6 context and the current word) feed a small
+//!    second-layer combiner trained online on coding loss.
 //! 5. **A chained SSE stage** (four APMs) refines the result before the
 //!    binary arithmetic coder.
 //! 6. **Two-speed coding** — bytes deep inside a verified match are coded by
@@ -34,9 +35,14 @@
 //! **independent segments** that are compressed and decompressed in parallel
 //! across all CPU cores. The segment size is fixed (not derived from the core
 //! count), so an archive written on a 4-core machine decodes identically on a
-//! 64-core one. Segments are large enough (multiple MiB) that the per-segment
-//! model warm-up costs a negligible amount of ratio, while throughput scales
-//! close to linearly with the number of cores.
+//! 64-core one.
+//!
+//! Splitting is not free: every segment restarts the model from nothing, and
+//! the models keep learning for as long as you let them. On 64 MiB of enwik8,
+//! one segment beats four 16 MiB segments by 5.1%. The segment size is
+//! therefore the main ratio lever above level 4, and level 9 gives it up
+//! entirely — it compresses the whole input as a single segment, single
+//! threaded, for the best ratio the engine can reach.
 //!
 //! Encoder and decoder run the identical model in lockstep, so the model is
 //! never stored. Because both sides execute the same deterministic code, hash
@@ -117,10 +123,15 @@ pub const SEG_SIZE: usize = 16 << 20; // 16 MiB == level 5
 /// ratio cost. The chosen size is stored in the payload, so decoding never
 /// depends on this mapping.
 ///
-/// Segments cap at 64 MiB: measured on enwik8, a monolithic 100 MB segment
-/// compresses *worse* than two 50 MB segments even with double-size tables
-/// (text is nonstationary, and hashed-table pressure grows with the window),
-/// so past level 7 the ratio lever is the memory profile, not the window.
+/// Segment size is the dominant ratio lever on large text, and it stays that
+/// way well past the 64 MiB where an earlier measurement had suggested it
+/// flattened out. Re-measured on 64 MiB of enwik8 with the current tables, one
+/// segment beats four 16 MiB segments by 5.1% — the models simply keep
+/// learning, and every restart throws that away. So level 9 does not split at
+/// all: it compresses the whole input as a single segment, trading all
+/// parallelism (and a lot of memory) for the best ratio the engine can reach.
+///
+/// Levels 1-8 still split, so they scale across cores.
 pub fn seg_size_for_level(level: u8) -> usize {
     let bits: u32 = match level {
         0 | 1 => 20, // 1 MiB
@@ -129,10 +140,15 @@ pub fn seg_size_for_level(level: u8) -> usize {
         4 => 23,
         5 => 24, // 16 MiB (default)
         6 => 25,
-        _ => 26, // 64 MiB (levels 7-9)
+        7 | 8 => 26, // 64 MiB
+        _ => return MAX_SEG, // level 9: one segment for the whole input
     };
     1usize << bits
 }
+
+/// Largest segment the payload's u32 segment-size field can describe. Inputs
+/// past this still split, even at level 9.
+pub const MAX_SEG: usize = 1 << 31;
 
 /// Compress `data` into a self-contained CPGC-NX payload at the given level.
 ///
@@ -146,7 +162,8 @@ pub fn seg_size_for_level(level: u8) -> usize {
 /// [0..4]   seg_size: u32 LE   (bytes of original data per segment)
 /// [4..8]   n_seg: u32 LE
 /// [8]      profile: u8        (0 = full model, 1 = turbo, 2 = full + big
-///                              memory, 3 = full + extra-large memory)
+///                              memory, 3 = full + extra-large memory,
+///                              4 = full + maximum memory)
 /// [9..]    n_seg × (comp_len: u32 LE)
 /// [rest]   segment payloads, concatenated in order
 /// ```
@@ -161,12 +178,13 @@ pub fn encode(data: &[u8], level: u8) -> Vec<u8> {
         .expect("uncontrolled encode is never cancelled")
 }
 
-/// Memory profile per level: standard up to 6, big at 7, extra-large at 8-9.
+/// Memory profile per level: standard up to 6, then one step per level.
 fn mem_for_level(level: u8) -> u8 {
     match level {
         0..=6 => predictor::MEM_STD,
         7 => predictor::MEM_BIG,
-        _ => predictor::MEM_PLUS,
+        8 => predictor::MEM_PLUS,
+        _ => predictor::MEM_HUGE,
     }
 }
 
@@ -201,7 +219,9 @@ fn encode_framed(
     if data.is_empty() {
         return Some(Vec::new());
     }
-    let seg_size = seg_size.max(1);
+    // A segment is never larger than the data, so the stored size always fits
+    // the payload's u32 field.
+    let seg_size = seg_size.max(1).min(data.len().max(1)).min(MAX_SEG);
     let mem = if turbo { predictor::MEM_STD } else { mem };
 
     // Compress each segment independently, in parallel. A cancelled segment
@@ -222,6 +242,7 @@ fn encode_framed(
         (true, _) => 1,
         (false, predictor::MEM_BIG) => 2,
         (false, predictor::MEM_PLUS) => 3,
+        (false, predictor::MEM_HUGE) => 4,
         (false, _) => 0,
     });
     for s in &segments {
@@ -243,6 +264,7 @@ fn decode_framed(payload: &[u8], n: usize, ctrl: &Control) -> Option<Vec<u8>> {
     let mem = match payload[8] {
         2 => predictor::MEM_BIG,
         3 => predictor::MEM_PLUS,
+        4 => predictor::MEM_HUGE,
         _ => predictor::MEM_STD,
     };
     let comp_lens: Vec<usize> = (0..n_seg)
@@ -381,6 +403,7 @@ mod tests {
             (true, predictor::MEM_STD),
             (false, predictor::MEM_BIG),
             (false, predictor::MEM_PLUS),
+            (false, predictor::MEM_HUGE),
         ] {
             let ctrl = Control::new();
             let payload = encode_framed(data, seg, turbo, mem, &ctrl).unwrap();

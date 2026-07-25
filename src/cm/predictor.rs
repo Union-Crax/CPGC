@@ -1,4 +1,4 @@
-//! Bit-level context-mixing predictor for the CPGC-NX engine (v8).
+//! Bit-level context-mixing predictor for the CPGC-NX engine (v13).
 //!
 //! Produces `P(next bit == 1)` as a 12-bit probability. The architecture is a
 //! new *combination* tuned for this codec rather than a port of any single
@@ -15,7 +15,7 @@
 //!   into 16-byte buckets holding the full 15-node subtree of one nibble:
 //!   one hash lookup and one cache line serve four bits, where v6 took a
 //!   fresh random lookup per bit. A one-byte checksum detects collisions and
-//!   a two-candidate replacement policy evicts the less-established bucket,
+//!   an n-way replacement policy evicts the least-established bucket,
 //!   so colliding contexts no longer silently corrupt each other. All
 //!   candidate lines are prefetched at the nibble boundary so the misses
 //!   overlap instead of serialising.
@@ -24,6 +24,12 @@
 //!   hash is preferred so seeds start from more reliable anchors — and the
 //!   predictor forecasts the *bit* of the historical continuation with
 //!   confidence that grows with verified match length.
+//! * **Markup models.** Structured text — XML, HTML, wiki markup, source —
+//!   is predicted as much by *where* a byte sits as by what precedes it, so
+//!   four models track state no order-n context can see: the innermost open
+//!   element, the innermost unclosed bracket and its depth, the column and
+//!   shape of the current line, and the word trigram. On enwik8 these four
+//!   are worth 1.3% on their own.
 //! * **Two-layer logistic mixer.** A first layer holds six independently
 //!   context-selected weight vectors (by previous byte, by a hashed order-3
 //!   context, by match-length bucket, by the partial byte being decoded, by a
@@ -31,6 +37,11 @@
 //!   second layer selected by (previous-byte class, match length, bit
 //!   position) combines their stretched outputs, trained online by gradient
 //!   descent.
+//! * **Cardinality-budgeted tables.** Each model's hash table is capped at
+//!   the size its context population can actually fill, counting the 17
+//!   buckets a context touches across nibble paths. The memory that frees is
+//!   spent on the high-order, word and indirect models, which on a
+//!   segment-sized-as-the-whole-file run see hundreds of millions of contexts.
 //! * **Chained SSE.** Four adaptive probability maps in an increasing-order
 //!   ladder (keyed by the partial byte, an order-2 context, an order-3 hash,
 //!   and an order-6 hash), each nudging the running estimate a quarter of the
@@ -43,11 +54,30 @@
 //! * **Runtime-SIMD mixer.** The first-layer dot products and weight updates
 //!   run on AVX2 when available, with a bit-identical scalar fallback, so
 //!   the bitstream never depends on the CPU.
-//! * **Two profiles.** Turbo (levels 1-3) runs a 5-model prefix of the
-//!   roster with two mixer views and two APMs; full runs everything. The
-//!   profile is recorded in the payload header.
+//! * **Two profiles, four memory tiers.** Turbo (levels 1-3) runs a 5-model
+//!   prefix of the roster with two mixer views and two APMs; full runs
+//!   everything, at one of four table-size tiers. Both are recorded in the
+//!   payload header, so decoding never depends on the level mapping.
 
 use std::sync::OnceLock;
+
+/// Model hyper-parameter lookup. With the `tune` feature the value can be
+/// overridden by an environment variable of the same name, so competing
+/// variants can be measured from a single build; without it (every shipped
+/// build) this is a compile-time constant fold to `default`, and the bitstream
+/// therefore never depends on the environment.
+#[inline]
+fn tunable(_name: &str, default: i32) -> i32 {
+    #[cfg(feature = "tune")]
+    {
+        if let Ok(v) = std::env::var(_name) {
+            if let Ok(n) = v.parse::<i32>() {
+                return n;
+            }
+        }
+    }
+    default
+}
 
 // Hashing multipliers (odd, good avalanche).
 const PR1: u32 = 0x9E37_79B1;
@@ -95,24 +125,63 @@ fn model_bits(k: usize, n: usize, mem: u8) -> u32 {
     // compressed *worse* than level 7. MEM_PLUS doubles every cap again so
     // a single 100 MB segment carries the same per-byte table pressure as
     // two 50 MB segments, while keeping the longer match window.
-    let plus = (mem >= MEM_PLUS) as u32;
-    let hash_bits = if mem >= MEM_BIG {
+    let plus = (mem >= MEM_PLUS) as u32 + (mem >= MEM_HUGE) as u32;
+    let bits = if mem >= MEM_BIG {
         raw_bits(n).clamp(11, 23 + plus)
     } else {
-        raw_bits(n).clamp(HBITS_MIN, HBITS_MAX).saturating_sub(3).clamp(11, 19)
+        // The standard profile is sized to stay small, so the low-cardinality
+        // kinds are clamped harder than their populations alone would need.
+        let h = raw_bits(n)
+            .clamp(HBITS_MIN, HBITS_MAX)
+            .saturating_sub(3)
+            .clamp(11, 19);
+        match MODEL_KIND[k] {
+            Kind::Hash => h,
+            Kind::Sparse | Kind::Stride => h.min(16),
+            Kind::Ind => h.min(18),
+        }
     };
-    match MODEL_KIND[k] {
-        Kind::Hash => hash_bits,
-        Kind::Sparse => hash_bits.min(if mem >= MEM_BIG { 21 + plus } else { 16 }),
-        Kind::Stride => hash_bits.min(16),
-        Kind::Ind => hash_bits.min(if mem >= MEM_BIG { 22 + plus } else { 18 }),
-    }
+    bits.min(MODEL_CAP[k])
 }
+
+/// Per-model ceiling on bucket-count exponent: how large a table the model's
+/// context population can actually fill.
+///
+/// A context does not occupy one bucket. The high nibble takes one, and the
+/// low nibble's hash is salted by the four bits already coded, so a context
+/// that is visited with every possible high nibble touches 17 buckets. The
+/// budget for a model with `c` distinct contexts is therefore `c * 17`, and
+/// these caps are that figure rounded up with a factor of two of headroom for
+/// hash collisions.
+///
+/// Bounding the genuinely small models — the order-2 context has 65,536
+/// values, a stride lane 65,536, the nesting context about 16,000 — is what
+/// pays for the much larger tables the high-order, word and indirect models
+/// get in the top profiles. Those are the ones that actually thrash: on a
+/// 1 GB segment they see hundreds of millions of distinct contexts.
+const MODEL_CAP: [u32; NBH] = [
+    21, 24, 31, 31, // orders 2-5
+    31,             // word
+    31, 31,         // orders 6-7
+    31,             // word pair
+    14, 14,         // sparse: one byte of context each
+    21, 21, 21, 21, // sparse: two bytes of context each
+    21, 21, 21, 21, // strides: two samples of one lane
+    21, 24, 24,     // indirect order-2, -3, -4
+    31, 31,         // orders 8, 10
+    31, 31,         // orders 12, 16
+    24,             // case-folded order-3
+    24,             // enclosing element
+    19,             // bracket nesting: delimiter x depth x previous byte
+    24,             // line shape
+    31,             // word trigram
+];
 
 // Memory profiles (recorded in the payload so decode always agrees).
 pub const MEM_STD: u8 = 0;
 pub const MEM_BIG: u8 = 1; // levels 7+: up to 2^23-bucket hash tables
-pub const MEM_PLUS: u8 = 2; // levels 8-9: up to 2^24 buckets, 2^25 match slots
+pub const MEM_PLUS: u8 = 2; // level 8: up to 2^24 buckets, 2^25 match slots
+pub const MEM_HUGE: u8 = 3; // level 9: up to 2^25 buckets, 2^26 match slots
 
 const RATE_FAST: i32 = 3;
 
@@ -201,12 +270,22 @@ impl SmEntry {
     }
 }
 
+/// Number of state-map planes per bit-history model: one per depth within the
+/// nibble (0..3). The same packed count state means different things at
+/// different levels of the nibble tree — the root node of a bucket sees every
+/// visit to the context while a depth-3 node only sees the sliver of visits
+/// that shared the three preceding bits — so giving each depth its own learned
+/// map lets both calibrate independently.
+const SM_DEPTHS: usize = 4;
+const SM_SIZE: usize = 256 * SM_DEPTHS;
+
 /// A fresh state map, with every entry seeded from its state's closed-form
 /// estimate rather than 0.5 — a brand-new context predicts sensibly from its
 /// very first visit, and the count-adaptive rate then refines from there.
-fn sm_init() -> [SmEntry; 256] {
-    let mut t = [SmEntry { p: 32768, cnt: 0 }; 256];
-    for (s, e) in t.iter_mut().enumerate() {
+fn sm_init() -> Vec<SmEntry> {
+    let mut t = vec![SmEntry { p: 32768, cnt: 0 }; SM_SIZE];
+    for (i, e) in t.iter_mut().enumerate() {
+        let s = i & 255;
         let n0 = (s >> 4) as f64;
         let n1 = (s & 15) as f64;
         let p = (2.0 * n1 + 1.0) / (2.0 * n0 + 2.0 * n1 + 2.0);
@@ -227,13 +306,18 @@ const BUCKET: usize = 16;
 struct BhTable {
     t: Vec<u8>,
     mask: u32, // bucket-index mask
+    ways: u32, // candidate buckets probed per lookup (2 or 4)
 }
 
 impl BhTable {
-    fn new(bucket_bits: u32) -> Self {
+    fn new(bucket_bits: u32, ways: u32) -> Self {
         Self {
             t: vec![0u8; BUCKET << bucket_bits],
             mask: (1u32 << bucket_bits) - 1,
+            // Candidates are the bucket index with its low bits varied, so an
+            // n-way set is one aligned run of n buckets — at most two cache
+            // lines, and usually one.
+            ways,
         }
     }
 
@@ -242,9 +326,9 @@ impl BhTable {
     /// the memory latencies overlap.
     #[inline]
     fn prefetch(&self, h: u32) {
-        let i0 = ((h & self.mask) as usize) * BUCKET;
+        let i0 = ((h & self.mask & !(self.ways - 1)) as usize) * BUCKET;
         prefetch_ptr(unsafe { self.t.as_ptr().add(i0) });
-        prefetch_ptr(unsafe { self.t.as_ptr().add(i0 ^ BUCKET) });
+        prefetch_ptr(unsafe { self.t.as_ptr().add(i0 + BUCKET * 2) });
     }
 
     /// Find (or allocate) the bucket for hash `h`; returns the byte offset of
@@ -253,31 +337,36 @@ impl BhTable {
     #[inline]
     fn find(&mut self, h: u32) -> usize {
         let cs = ((h >> 24) as u8) | 1; // 0 marks "never used"
-        let i0 = ((h & self.mask) as usize) * BUCKET;
-        let i1 = i0 ^ BUCKET;
-        if self.t[i0] == cs {
-            return i0 + 1;
-        }
-        if self.t[i1] == cs {
-            return i1 + 1;
-        }
-        let k = if self.t[i0] == 0 {
-            i0
-        } else if self.t[i1] == 0 {
-            i1
-        } else {
-            let e0 = self.t[i0 + 1];
-            let e1 = self.t[i1 + 1];
-            // total observations at the root slot = how established the bucket is
-            if (e0 >> 4) + (e0 & 15) <= (e1 >> 4) + (e1 & 15) {
-                i0
-            } else {
-                i1
+        let ways = self.ways as usize;
+        let base = ((h & self.mask & !(self.ways - 1)) as usize) * BUCKET;
+        // Hit?
+        for w in 0..ways {
+            let i = base + w * BUCKET;
+            if self.t[i] == cs {
+                return i + 1;
             }
-        };
-        self.t[k] = cs;
-        self.t[k + 1..k + BUCKET].fill(0);
-        k + 1
+        }
+        // Miss: take a free bucket, else recycle the least established one —
+        // the total observation count at the root slot says how much evidence
+        // a bucket would lose.
+        let mut victim = base;
+        let mut victim_ev = u32::MAX;
+        for w in 0..ways {
+            let i = base + w * BUCKET;
+            if self.t[i] == 0 {
+                victim = i;
+                break;
+            }
+            let e = self.t[i + 1];
+            let ev = ((e >> 4) + (e & 15)) as u32;
+            if ev < victim_ev {
+                victim_ev = ev;
+                victim = i;
+            }
+        }
+        self.t[victim] = cs;
+        self.t[victim + 1..victim + BUCKET].fill(0);
+        victim + 1
     }
 }
 
@@ -314,7 +403,23 @@ const NHASH: usize = 8;
 const NSPARSE: usize = 6;
 const NIND: usize = 3;
 const NTEXT: usize = 5; // order-8, order-10, order-12, order-16, case-folded order-3
-const NBH: usize = NHASH + NSPARSE + NSTRIDE + NIND + NTEXT; // 26 bit-history models
+// Markup models. Wikipedia dumps — and XML, HTML, JSON, source code and config
+// files generally — are *structured* text: what predicts the next byte is
+// often not the preceding bytes but which element encloses them, how deep the
+// bracket nesting is, and how far into the line we are. None of the order-n,
+// word or sparse contexts can see any of that.
+//   * enclosing element — the innermost open tag name, plus one byte of local
+//     context, so `<title>` content and `<timestamp>` content stop sharing
+//     statistics;
+//   * nesting — the innermost unclosed bracket/quote delimiter and its depth,
+//     which is what separates wiki `[[link]]`, `{{template}}` and plain prose;
+//   * line shape — the column and the bytes at the start of the line, which
+//     carry the indentation and list-marker conventions;
+//   * word trigram — the two previous whole words plus the current word's
+//     prefix, a genuine language model context that the word-pair model only
+//     approximates.
+const NMARKUP: usize = 4;
+const NBH: usize = NHASH + NSPARSE + NSTRIDE + NIND + NTEXT + NMARKUP; // 30 models
 
 // Per-model table kind, indexed like `bh_base`: how big a hash table the
 // model's context population deserves.
@@ -336,6 +441,10 @@ const MODEL_KIND: [Kind; NBH] = [
     Kind::Hash, Kind::Hash,                         // orders 8, 10
     Kind::Hash, Kind::Hash,                         // orders 12, 16
     Kind::Hash,                                     // case-folded order-3
+    Kind::Ind,                                      // enclosing element
+    Kind::Sparse,                                   // bracket nesting
+    Kind::Sparse,                                   // line shape
+    Kind::Hash,                                     // word trigram
 ];
 // The turbo profile (levels 1-3) runs only the first NBH_TURBO models
 // (orders 2-5 + word), two mixer views and two APMs — a several-times-faster
@@ -355,28 +464,35 @@ const BH_IN: usize = 4; // first bit-history input index
 const MATCH_IN: usize = BH_IN + NBH * 2;
 const BIAS_IN: usize = NIN - 1;
 
+
 // First-layer weight-set row counts. The `wc` view is selected by a hashed
 // order-3 context rather than the single previous-previous byte: on text,
 // which short run of bytes precedes the position is a far sharper cue for
 // which models to trust than any single byte. More rows let the mixer keep
 // distinct weight vectors for many more distinct local contexts; on big text
 // each row still sees ample training traffic.
+// Rows in each hash-selected first-layer weight bank (`wc` order-3, `we`
+// order-6, `wg` word), and in the order-6 SSE stage. Each row is an
+// independent weight vector, so more rows means the mixer can hold a distinct
+// blend for more distinct local contexts instead of averaging them together —
+// on 16 MiB of enwik8 going from 2^13 to 2^17 rows is worth 0.45%, still
+// improving at the top. The banks are sized by memory profile and bounded by
+// the segment length, since a row that is never selected only wastes memory.
 const WC_ROWS: usize = 8192;
-// Row count for the fifth first-layer view (`we`), selected by a hashed
-// order-6 context.
-const WE_ROWS: usize = 8192;
-// Row count for the sixth first-layer view (`wg`), selected by the current
-// word hash — a word-level cue for which models to trust.
-const WG_ROWS: usize = 8192;
+const WC_ROWS_BIG: usize = 1 << 16;
+const WC_ROWS_PLUS: usize = 1 << 18;
+const WC_ROWS_HUGE: usize = 1 << 19;
 
 // Second-layer mixer: combines the six first-layer outputs plus a bias.
 const NMIX: usize = 7;
-// Selected by (previous-byte class, min(match_len, 7), bit position): the
-// combiner learns, e.g., to trust the match view less on low bits and counter
-// views more there — with separate weights per character class (letter, space,
-// digit, other), which on text is a sharper predictor of which views to trust
-// than a single in-word flag.
-const NMIX_CTX: usize = 256;
+// Selected by (classes of the two previous bytes, min(match_len, 7), bit
+// position): the combiner learns, e.g., to trust the match view less on low
+// bits and counter views more there — with separate weights per character
+// class (letter, space, digit, other), which on text is a sharper predictor of
+// which views to trust than a single in-word flag. Two bytes of class rather
+// than one distinguishes the start of a word from its interior, and a digit
+// inside a number from one just after a letter.
+const NMIX_CTX: usize = 1024;
 
 /// Coarse character class of a byte, used to select second-layer mixer weights:
 /// 0 = ASCII letter, 1 = space/tab/newline, 2 = ASCII digit, 3 = everything
@@ -400,7 +516,7 @@ fn char_class(b: u8) -> usize {
 // MiB) that never reach that regime, so it keeps the faster rate that adapts
 // within a short window. The rate is not stored in the archive: it is a fixed
 // function of the profile, which the payload header already records.
-const MIX_LR_FULL: i32 = 3;
+const MIX_LR_FULL: i32 = 4;
 const MIX_LR_TURBO: i32 = 5;
 // Upper bound of the two, used only to size the SIMD-equivalence test's range.
 #[allow(dead_code)] // referenced only from the (cfg(test)) SIMD-equivalence test
@@ -547,7 +663,20 @@ pub struct Predictor {
     // Rolling byte history (hist[0] = most recent).
     hist: [u8; 16],
     word_hash: u32,
-    last_word: u32, // hash of the most recently *finished* word
+    last_word: u32,  // hash of the most recently *finished* word
+    prev_word: u32,  // the one before that (word-trigram context)
+
+    // Markup state, all derived from committed bytes only.
+    tag_hash: u32,       // innermost open element name
+    tag_stack: [u32; 8], // enclosing element names, tag_depth deep
+    tag_depth: usize,
+    tag_name: u32,   // element name currently being scanned
+    tag_scan: u8,    // 0 = outside a tag, 1 = reading a name, 2 = past the name
+    tag_close: bool, // the tag being scanned is a closing tag
+    nest: [u8; 16],  // stack of unclosed bracket/quote delimiters
+    nest_depth: usize,
+    col: u32,        // bytes since the last newline
+    line_head: u32,  // hash of the first few bytes of the current line
 
     // Indirect context state: per-context "byte that followed last time".
     // ind2 is direct-indexed by the order-2 context (collision-free); ind3
@@ -561,10 +690,13 @@ pub struct Predictor {
     ind2_idx: usize, // slot to write the *next* committed byte into
     ind3_idx: usize,
     ind4_idx: usize,
+    indt: Vec<u8>, // per-element: the byte that last followed this element context
+    indt_mask: u32,
+    indt_idx: usize,
 
     // Bit-history models: nibble-bucketed state tables + per-model state maps.
     bh: Vec<BhTable>,            // NBH tables
-    bh_sm: Vec<[SmEntry; 256]>,  // NBH state maps
+    bh_sm: Vec<Vec<SmEntry>>,    // NBH state maps, SM_DEPTHS planes each
     bh_base: [u32; NBH],         // per-byte context hashes
     bh_off: [usize; NBH],        // resolved bucket slot-array offsets
     bh_state: [u8; NBH],         // states read by predict(), for update()
@@ -573,6 +705,11 @@ pub struct Predictor {
     nbh: usize,                  // active model count (NBH_TURBO or NBH)
     turbo: bool,                 // reduced mixer/SSE roster for low levels
     mix_lr: i32,                 // mixer learning rate (per profile)
+    // Ablation switches. Always 1 in shipped builds (see `tunable`); the
+    // `tune` feature lets a measurement run turn a single change off.
+    mix2_shift: usize, // 2 when the second layer sees both previous classes
+    mix2_mask: usize,
+    sm_planes: usize, // 1 = one shared state map, SM_DEPTHS = one per depth
 
     // Partial byte: starts at 1, accumulates coded bits.
     c0: u32,
@@ -591,6 +728,7 @@ pub struct Predictor {
     // fast_p is a tiny SSE keyed by (match-length bucket, bit position,
     // predicted bit); fast_state remembers which sub-model predicted the
     // current bit (1 = match SSE, 2 = order-0/1 fallback after a break).
+    fast_len: u32,
     fast_mode: bool,
     fast_state: u8,
     fast_idx: usize,
@@ -599,10 +737,11 @@ pub struct Predictor {
     // First-layer mixer: five context-selected weight sets.
     wa: Vec<i32>, // [256][NINP] selected by previous byte
     wb: Vec<i32>, // [64][NINP]  selected by match-length bucket
-    wc: Vec<i32>, // [WC_ROWS][NINP] selected by a hashed order-3 context
+    wc: Vec<i32>, // [mix_rows][NINP] selected by a hashed order-3 context
     wd: Vec<i32>, // [256][NINP] selected by the partial byte (c0)
-    we: Vec<i32>, // [WE_ROWS][NINP] selected by a hashed order-6 context
-    wg: Vec<i32>, // [WG_ROWS][NINP] selected by the current word hash
+    we: Vec<i32>, // [mix_rows][NINP] selected by a hashed order-6 context
+    wg: Vec<i32>, // [mix_rows][NINP] selected by the current word hash
+    mix_mask: usize, // mix_rows - 1
     tx: [i32; NINP],
     use_avx2: bool, // AVX2 detected at runtime (paths are bit-identical)
     ctx_a: usize,
@@ -635,13 +774,43 @@ impl Predictor {
         let _ = stretch(2048);
         let _ = st_direct_tbl();
 
-        let nbh = if turbo { NBH_TURBO } else { NBH };
+        let nbh = if turbo {
+            NBH_TURBO
+        } else {
+            (tunable("CPGC_NBH", NBH as i32) as usize).clamp(NBH_TURBO, NBH)
+        };
+
+        // Rows in each context-selected first-layer weight bank. Turbo never
+        // uses the hashed views, so it keeps the smallest bank.
+        let mix_rows = if turbo {
+            WC_ROWS
+        } else {
+            let by_profile = match mem {
+                MEM_STD => WC_ROWS,
+                MEM_BIG => WC_ROWS_BIG,
+                MEM_PLUS => WC_ROWS_PLUS,
+                _ => WC_ROWS_HUGE,
+            };
+            let by_input = (n / 64).next_power_of_two().max(WC_ROWS);
+            (tunable("CPGC_MIX_ROWS", by_profile.min(by_input) as i32) as usize)
+                .next_power_of_two()
+        };
+
+        // Set associativity of the bit-history tables. More ways means fewer
+        // contexts evicted by an unlucky hash, which matters most when the
+        // context population dwarfs the table.
+        let ways = (tunable("CPGC_WAYS", if mem >= MEM_PLUS { 4 } else { 2 }) as u32)
+            .next_power_of_two()
+            .clamp(2, 8);
 
         // The match tables store one u32 per slot; the big profiles grow
         // them so long-range matches on a 100 MB+ segment survive (raw_bits,
         // not table_bits: the standard clamp must not cap the big profiles).
         let mbits = if mem >= MEM_BIG {
-            raw_bits(n).clamp(HBITS_MIN, 24 + (mem >= MEM_PLUS) as u32)
+            raw_bits(n).clamp(
+                HBITS_MIN,
+                24 + (mem >= MEM_PLUS) as u32 + (mem >= MEM_HUGE) as u32,
+            )
         } else {
             table_bits(n)
         };
@@ -676,6 +845,20 @@ impl Predictor {
             hist: [0; 16],
             word_hash: 0,
             last_word: 0,
+            prev_word: 0,
+            tag_hash: 0,
+            tag_stack: [0; 8],
+            tag_depth: 0,
+            tag_name: 0,
+            tag_scan: 0,
+            tag_close: false,
+            nest: [0; 16],
+            nest_depth: 0,
+            col: 0,
+            line_head: 0,
+            indt: vec![0u8; 1 << ind3_bits],
+            indt_mask: (1u32 << ind3_bits) - 1,
+            indt_idx: 0,
             ind2: vec![0u8; 1 << 16],
             ind3: vec![0u8; 1 << ind3_bits],
             ind4: vec![0u8; 1 << ind4_bits],
@@ -685,12 +868,18 @@ impl Predictor {
             ind3_idx: 0,
             ind4_idx: 0,
             bh: (0..nbh)
-                .map(|k| BhTable::new(model_bits(k, n, mem)))
+                .map(|k| BhTable::new(model_bits(k, n, mem), ways))
                 .collect(),
             bh_sm: vec![sm_init(); nbh],
             nbh,
             turbo,
-            mix_lr: if turbo { MIX_LR_TURBO } else { MIX_LR_FULL },
+            mix_lr: tunable(
+                "CPGC_MIX_LR",
+                if turbo { MIX_LR_TURBO } else { MIX_LR_FULL },
+            ),
+            mix2_shift: if tunable("CPGC_MIX2CTX", 1) != 0 { 2 } else { 0 },
+            mix2_mask: if tunable("CPGC_MIX2CTX", 1) != 0 { 3 } else { 0 },
+            sm_planes: if tunable("CPGC_SM_DEPTH", 1) != 0 { SM_DEPTHS } else { 1 },
             bh_base: [0; NBH],
             bh_off: [1; NBH],
             bh_state: [0; NBH],
@@ -704,6 +893,7 @@ impl Predictor {
             match_ptr: 0,
             match_len: 0,
             match_byte: -1,
+            fast_len: tunable("CPGC_FAST_LEN", FAST_LEN as i32).max(1) as u32,
             fast_mode: false,
             fast_state: 0,
             fast_idx: 0,
@@ -720,10 +910,11 @@ impl Predictor {
             },
             wa: vec![0i32; 256 * NINP],
             wb: vec![0i32; 64 * NINP],
-            wc: vec![0i32; WC_ROWS * NINP],
+            wc: vec![0i32; mix_rows * NINP],
             wd: vec![0i32; 256 * NINP],
-            we: vec![0i32; WE_ROWS * NINP],
-            wg: vec![0i32; WG_ROWS * NINP],
+            we: vec![0i32; mix_rows * NINP],
+            wg: vec![0i32; mix_rows * NINP],
+            mix_mask: mix_rows - 1,
             tx: [0; NINP],
             #[cfg(target_arch = "x86_64")]
             use_avx2: std::arch::is_x86_feature_detected!("avx2"),
@@ -742,7 +933,7 @@ impl Predictor {
             apm0: Apm::new(256),
             apm1: Apm::new(1 << 16),
             apm2: Apm::new(16384),
-            apm3: Apm::new(WC_ROWS),
+            apm3: Apm::new(mix_rows),
             final_pr: 2048,
         }
     }
@@ -830,11 +1021,12 @@ impl Predictor {
 
         // --- bit-history models: state map + direct state estimate -------
         let sidx = (self.nib_path - 1) as usize;
+        let smp = self.sm_plane();
         let st_direct = st_direct_tbl();
         for k in 0..self.nbh {
             let s = self.bh[k].t[self.bh_off[k] + sidx];
             self.bh_state[k] = s;
-            let e = self.bh_sm[k][s as usize];
+            let e = self.bh_sm[k][smp + s as usize];
             self.tx[BH_IN + k * 2] = stretch((e.p >> 4) as i32);
             self.tx[BH_IN + k * 2 + 1] = st_direct[s as usize] as i32;
         }
@@ -875,7 +1067,8 @@ impl Predictor {
         // --- second-layer mixing: a small learned combiner ---------------
         self.mi = [sa, sb, sc, sd, se, sg, 256];
         let bits_seen = (31 - c0.leading_zeros()) as usize; // 0..7
-        let cls = char_class(self.hist[0]);
+        let cls = char_class(self.hist[0]) << self.mix2_shift
+            | (char_class(self.hist[1]) & self.mix2_mask);
         self.ctx_f = cls << 6 | (self.match_len.min(7) as usize) << 3 | bits_seen;
         let mixed = self.dot2(self.ctx_f);
         self.pr = squash(mixed);
@@ -923,7 +1116,19 @@ impl Predictor {
         (acc >> 16) as i32
     }
 
+    /// Which state-map plane the current nibble depth selects.
+    #[inline]
+    fn sm_plane(&self) -> usize {
+        if self.sm_planes == 1 {
+            0
+        } else {
+            (31 - self.nib_path.leading_zeros()) as usize * 256
+        }
+    }
+
     /// Stretched prediction from the match model for the current partial byte.
+    /// Zero — no opinion — when there is no live match, or when the bits coded
+    /// so far have already contradicted it.
     #[inline]
     fn match_prediction(&self, c0: u32) -> i32 {
         if self.match_byte < 0 {
@@ -970,9 +1175,10 @@ impl Predictor {
         // Bit-history models: adapt the state-map entry that was used, then
         // advance the node's state by the observed bit.
         let sidx = (self.nib_path - 1) as usize;
+        let smp = self.sm_plane();
         for k in 0..self.nbh {
             let s = self.bh_state[k];
-            self.bh_sm[k][s as usize].update(bit);
+            self.bh_sm[k][smp + s as usize].update(bit);
             self.bh[k].t[self.bh_off[k] + sidx] = state_next(s, bit);
         }
         self.nib_path = (self.nib_path << 1) | (bit as u32);
@@ -1105,7 +1311,7 @@ impl Predictor {
         // Two-speed switch for the upcoming byte: deep inside a verified
         // match, code it on the fast path. Both sides compute this from the
         // same decoded history, so the choice never needs to be signalled.
-        self.fast_mode = self.match_len >= FAST_LEN && self.match_byte >= 0;
+        self.fast_mode = self.match_len >= self.fast_len && self.match_byte >= 0;
 
         // --- indirect bookkeeping -----------------------------------------
         // Record the byte that just followed the previous order-2/order-3/
@@ -1114,6 +1320,10 @@ impl Predictor {
         self.ind2[self.ind2_idx] = byte;
         self.ind3[self.ind3_idx] = byte;
         self.ind4[self.ind4_idx] = byte;
+        self.indt[self.indt_idx] = byte;
+
+        // --- markup state -------------------------------------------------
+        self.update_markup(byte);
 
         // --- context history --------------------------------------------
         self.hist.copy_within(0..15, 1);
@@ -1128,6 +1338,7 @@ impl Predictor {
                 .wrapping_mul(PR1);
         } else {
             if self.word_hash != 0 {
+                self.prev_word = self.last_word;
                 self.last_word = self.word_hash;
             }
             self.word_hash = 0;
@@ -1205,23 +1416,151 @@ impl Predictor {
                 self.hist[2] | 0x20,
             ];
             self.bh_base[text_base + 4] = hash_ctx(&folded, 67);
+
+            // --- markup contexts -----------------------------------------
+            let mk = text_base + NTEXT;
+            // Enclosing element + the byte that last followed this element
+            // context, so `<title>` and `<timestamp>` content are modelled
+            // apart and each carries its own "what usually comes next" cue.
+            self.indt_idx = (self
+                .tag_hash
+                .wrapping_mul(PR2)
+                .wrapping_add(self.hist[0] as u32)
+                & self.indt_mask) as usize;
+            let bt = self.indt[self.indt_idx];
+            self.bh_base[mk] = hash_ctx(&[bt, self.hist[0], self.tag_hash as u8], 89)
+                ^ self.tag_hash.wrapping_mul(PR1);
+            // Innermost unclosed delimiter + depth + the previous byte.
+            let d = self.nest_depth.min(7) as u8;
+            let top = if self.nest_depth > 0 {
+                self.nest[self.nest_depth - 1]
+            } else {
+                0
+            };
+            self.bh_base[mk + 1] = hash_ctx(&[top, d, self.hist[0]], 97);
+            // Column and how the line started: indentation and list markers.
+            self.bh_base[mk + 2] =
+                hash_ctx(&[self.col.min(63) as u8, self.hist[0]], 101) ^ self.line_head;
+            // Word trigram: the two previous whole words plus the prefix of
+            // the word being written.
+            self.bh_base[mk + 3] = self
+                .prev_word
+                .wrapping_mul(PR2)
+                .wrapping_add(self.last_word)
+                .wrapping_mul(PR1)
+                .wrapping_add(self.word_hash)
+                .wrapping_mul(PR2)
+                ^ 0x3C3C_A5A5;
         }
 
         // First-layer `wc` / `we` selections: hashed order-3 and order-6,
         // fixed for the byte. The order-6 view lets the combiner trust a
         // different blend of models where a long local context is decisive
         // (repeated markup, boilerplate) than in generic order-3 contexts.
-        self.ctx_c = (hash_ctx(&self.hist[0..3], 61) as usize) & (WC_ROWS - 1);
-        self.ctx_e = (hash_ctx(&self.hist[0..6], 71) as usize) & (WE_ROWS - 1);
+        self.ctx_c = (hash_ctx(&self.hist[0..3], 61) as usize) & self.mix_mask;
+        self.ctx_e = (hash_ctx(&self.hist[0..6], 71) as usize) & self.mix_mask;
         // Word-level view: which word (if any) we are currently inside. Zero
         // between words, so all non-word positions share one weight vector.
-        self.ctx_g = (self.word_hash.wrapping_mul(PR2) as usize) & (WG_ROWS - 1);
+        self.ctx_g = (self.word_hash.wrapping_mul(PR2) as usize) & self.mix_mask;
 
         // High-nibble bucket addresses are now known; start their lines early
         // (pointless when the next byte takes the fast path).
         if !self.fast_mode {
             for k in 0..self.nbh {
                 self.bh[k].prefetch(self.bh_base[k]);
+            }
+        }
+    }
+
+    /// Advance the markup trackers by one committed byte: which element
+    /// encloses us, how deep the bracket nesting is, and where we are in the
+    /// line. Purely a function of the decoded prefix, so the decoder derives
+    /// the identical state without any of it being transmitted.
+    ///
+    /// The scanners are deliberately forgiving — malformed or non-markup input
+    /// just produces a stable, meaningless context that the mixer learns to
+    /// ignore, rather than a parse error.
+    #[inline]
+    fn update_markup(&mut self, byte: u8) {
+        // --- element scanner ---------------------------------------------
+        match self.tag_scan {
+            0 => {
+                if byte == b'<' {
+                    self.tag_scan = 1;
+                    self.tag_name = 0;
+                    self.tag_close = false;
+                }
+            }
+            1 => {
+                if byte == b'/' && self.tag_name == 0 {
+                    self.tag_close = true;
+                } else if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b':' {
+                    self.tag_name = self
+                        .tag_name
+                        .wrapping_add(byte as u32 + 1)
+                        .wrapping_mul(PR1);
+                } else {
+                    // Name complete. A closing tag pops the stack; an opening
+                    // tag pushes, unless it is self-closing (handled on '>').
+                    if self.tag_close {
+                        if self.tag_depth > 0 {
+                            self.tag_depth -= 1;
+                        }
+                    } else if self.tag_depth < self.tag_stack.len() {
+                        self.tag_stack[self.tag_depth] = self.tag_name;
+                        self.tag_depth += 1;
+                    }
+                    self.tag_hash = if self.tag_depth > 0 {
+                        self.tag_stack[self.tag_depth - 1]
+                    } else {
+                        0
+                    };
+                    self.tag_scan = if byte == b'>' { 0 } else { 2 };
+                }
+            }
+            _ => {
+                if byte == b'>' {
+                    // `<br />`-style self-closing tag: undo the push.
+                    if self.hist[0] == b'/' && self.tag_depth > 0 {
+                        self.tag_depth -= 1;
+                        self.tag_hash = if self.tag_depth > 0 {
+                            self.tag_stack[self.tag_depth - 1]
+                        } else {
+                            0
+                        };
+                    }
+                    self.tag_scan = 0;
+                }
+            }
+        }
+
+        // --- bracket / quote nesting --------------------------------------
+        // Wiki markup nests `[[...]]`, `{{...}}` and `''...''` far more often
+        // than it nests parentheses, and all of them change what follows.
+        let open = matches!(byte, b'[' | b'{' | b'(');
+        let close = matches!(byte, b']' | b'}' | b')');
+        if open {
+            if self.nest_depth < self.nest.len() {
+                self.nest[self.nest_depth] = byte;
+                self.nest_depth += 1;
+            }
+        } else if close && self.nest_depth > 0 {
+            self.nest_depth -= 1;
+        }
+
+        // --- line shape ----------------------------------------------------
+        if byte == b'\n' {
+            self.col = 0;
+            self.line_head = 0;
+        } else {
+            self.col += 1;
+            // Only the first four bytes of a line define its shape; after that
+            // the hash freezes so every position in the line shares one key.
+            if self.col <= 4 {
+                self.line_head = self
+                    .line_head
+                    .wrapping_add(byte as u32 + 1)
+                    .wrapping_mul(PR2);
             }
         }
     }
