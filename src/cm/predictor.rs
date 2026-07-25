@@ -532,10 +532,14 @@ fn mix_lr_for(n: usize, turbo: bool) -> i32 {
         // Turbo only ever runs 1-4 MiB segments, well inside the fast regime.
         return MIX_LR_TURBO;
     }
-    match n {
-        0..=67_108_864 => 4,           // up to 64 MiB: levels 4-8
-        67_108_865..=536_870_912 => 3, // up to 512 MiB
-        _ => 2,
+    // Only two rates are warranted by measurement. Going lower still is not a
+    // safe extrapolation — it is actively wrong: on a 256 MB segment rate 2
+    // gives 48,252,748 bytes against rate 3's 45,980,493, giving back almost
+    // everything the larger window won.
+    if n <= 64 << 20 {
+        4
+    } else {
+        3
     }
 }
 // Upper bound over every profile, used only to size the SIMD-equivalence
