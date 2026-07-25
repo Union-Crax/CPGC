@@ -1,2 +1,4 @@
 mode,comp_bytes,comp_seconds,decomp_seconds,verified
 cpgc-1,23531756,29.4,27.7,1
+cpgc-2,22720026,29.6,28.0,1
+cpgc-3,22037386,32.2,30.8,1
