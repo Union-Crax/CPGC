@@ -513,15 +513,33 @@ fn char_class(b: u8) -> usize {
     }
 }
 
-// Mixer learning rate (scales the coding-error gradient applied to weights),
-// chosen per profile. The full profile runs large segments (8-64 MiB) where a
-// smaller rate converges to sharper weights; turbo runs small segments (1-4
-// MiB) that never reach that regime, so it keeps the faster rate that adapts
-// within a short window. The rate is not stored in the archive: it is a fixed
-// function of the profile, which the payload header already records.
-const MIX_LR_FULL: i32 = 4;
+// Mixer learning rate: how hard each coding error pushes the weights.
+//
+// The right rate falls as the segment gets longer, and it matters far more
+// than its size suggests. A rate that is right for a 16 MiB segment is much
+// too fast for a 128 MiB one — the weights chase noise instead of settling —
+// and the cost is not subtle: on a single 128 MiB segment, rate 4 gives
+// 25,258,023 bytes where rate 3 gives 23,925,575, a 5.3% difference. Getting
+// this wrong is what made large segments look like a dead end; with the rate
+// matched to the segment, one 128 MiB segment beats two 64 MiB ones by 2.7%.
+//
+// So the rate is a function of the segment length, which encoder and decoder
+// both know before they start, and it is never stored.
 const MIX_LR_TURBO: i32 = 5;
-// Upper bound of the two, used only to size the SIMD-equivalence test's range.
+/// Mixer learning rate for a segment of `n` bytes.
+fn mix_lr_for(n: usize, turbo: bool) -> i32 {
+    if turbo {
+        // Turbo only ever runs 1-4 MiB segments, well inside the fast regime.
+        return MIX_LR_TURBO;
+    }
+    match n {
+        0..=67_108_864 => 4,           // up to 64 MiB: levels 4-8
+        67_108_865..=536_870_912 => 3, // up to 512 MiB
+        _ => 2,
+    }
+}
+// Upper bound over every profile, used only to size the SIMD-equivalence
+// test's range.
 #[allow(dead_code)] // referenced only from the (cfg(test)) SIMD-equivalence test
 const MIX_LR: i32 = MIX_LR_TURBO;
 // First-layer weight clamp. ±2^19 at 16 fractional bits (gain ±8) keeps every
@@ -876,10 +894,7 @@ impl Predictor {
             bh_sm: vec![sm_init(); nbh],
             nbh,
             turbo,
-            mix_lr: tunable(
-                "CPGC_MIX_LR",
-                if turbo { MIX_LR_TURBO } else { MIX_LR_FULL },
-            ),
+            mix_lr: tunable("CPGC_MIX_LR", mix_lr_for(n, turbo)),
             mix2_shift: if tunable("CPGC_MIX2CTX", 1) != 0 { 2 } else { 0 },
             mix2_mask: if tunable("CPGC_MIX2CTX", 1) != 0 { 3 } else { 0 },
             sm_planes: if tunable("CPGC_SM_DEPTH", 1) != 0 { SM_DEPTHS } else { 1 },
