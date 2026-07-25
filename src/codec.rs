@@ -135,29 +135,39 @@ pub fn compress_with_control(input: &[u8], level: u8, ctrl: &cm::Control) -> Res
     // ------------------------------------------------------------------
     // Step 2: Build the two data streams
     // ------------------------------------------------------------------
-    let mut to_encode: Vec<u8> = Vec::with_capacity(n);
+    // When nothing was passed through or transformed — the common case on
+    // text — the coder can read `stream` directly. Assembling an identical
+    // copy would double peak memory, which at level 9 on a gigabyte-scale
+    // input is a gigabyte that has to come out of the models' budget.
+    let plain = block_tags.iter().all(|&t| t == TAG_NORMAL);
     let mut passthrough_data: Vec<u8> = Vec::new();
+    let mut assembled: Vec<u8> = Vec::new();
 
-    for block_idx in 0..n_blocks {
-        let start = block_idx * WINDOW_SIZE;
-        let end = (start + WINDOW_SIZE).min(n);
-        let chunk = &stream[start..end];
-        let tag = block_tags[block_idx];
+    if !plain {
+        assembled.reserve(n);
+        for block_idx in 0..n_blocks {
+            let start = block_idx * WINDOW_SIZE;
+            let end = (start + WINDOW_SIZE).min(n);
+            let chunk = &stream[start..end];
+            let tag = block_tags[block_idx];
 
-        if tag == TAG_PASSTHROUGH {
-            passthrough_data.extend_from_slice(chunk);
-        } else if let Some(ref tx) = block_transformed[block_idx] {
-            to_encode.extend_from_slice(tx);
-        } else {
-            to_encode.extend_from_slice(chunk);
+            if tag == TAG_PASSTHROUGH {
+                passthrough_data.extend_from_slice(chunk);
+            } else if let Some(ref tx) = block_transformed[block_idx] {
+                assembled.extend_from_slice(tx);
+            } else {
+                assembled.extend_from_slice(chunk);
+            }
         }
     }
+    let to_encode: &[u8] = if plain { stream } else { &assembled };
 
     // ------------------------------------------------------------------
     // Step 3: CPGC-NX context-mixing encode of the non-passthrough stream
     // ------------------------------------------------------------------
-    let ans_payload = cm::encode_with_control(&to_encode, level, ctrl)
+    let ans_payload = cm::encode_with_control(to_encode, level, ctrl)
         .ok_or_else(|| anyhow!("compression cancelled"))?;
+    drop(assembled);
 
     // ------------------------------------------------------------------
     // Step 4: Assemble output
@@ -271,6 +281,21 @@ pub fn decompress_with_control(input: &[u8], ctrl: &cm::Control) -> Result<Vec<u
     // ------------------------------------------------------------------
     // Reconstruct the coded stream's byte order from block tags
     // ------------------------------------------------------------------
+    // Same shortcut as on the encode side: with no passthrough and no
+    // transforms the decoded stream already *is* the output, and copying it
+    // block by block would only double peak memory.
+    if !text_dict && block_tags.iter().all(|&t| t == TAG_NORMAL) {
+        let crc_actual = crc32(&ans_decoded);
+        if crc_actual != crc_expected {
+            return Err(anyhow!(
+                "checksum mismatch: archive is corrupt or was written by an \
+                 incompatible version (expected {:#010x}, got {:#010x})",
+                crc_expected, crc_actual
+            ));
+        }
+        return Ok(ans_decoded);
+    }
+
     let mut output = Vec::with_capacity(stream_len);
     let mut ans_pos = 0usize;
     let mut pt_pos  = 0usize;

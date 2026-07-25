@@ -290,7 +290,13 @@ fn decode_framed(payload: &[u8], n: usize, ctrl: &Control) -> Option<Vec<u8>> {
         .par_iter()
         .map(|&(p, len)| decode_segment(p, len, turbo, mem, ctrl))
         .collect();
-    let parts = parts?;
+    let mut parts = parts?;
+
+    // Level 9 produces a single segment, and there the concatenation buffer
+    // would be a second full-size copy of the output for no reason.
+    if parts.len() == 1 {
+        return parts.pop();
+    }
 
     let mut out = Vec::with_capacity(n);
     for p in parts {

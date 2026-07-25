@@ -8,17 +8,22 @@ multi-file archives, and CRC-32-verifies every archive it decodes.
 
 ## How it works
 
-The engine predicts each bit from ~26 context models — hashed byte contexts
-(orders 2–16), word and word-pair models, sparse and stride contexts, indirect
-models, and a long-match model — combined by a two-layer logistic mixer and
-sharpened by a chained SSE stage before a binary arithmetic coder. Encoder and
-decoder update the same model in lockstep, so no model state is stored in the
-archive; it records only the segment size and model profile, so a file decodes
-identically regardless of the machine's CPU count or SIMD support.
+The engine predicts each bit from 30 context models — hashed byte contexts
+(orders 2–16), word, word-pair and word-trigram models, sparse and stride
+contexts, indirect models, markup models that track the enclosing XML element,
+the bracket nesting and the shape of the line, and a long-match model — combined
+by a two-layer logistic mixer and sharpened by a chained SSE stage before a
+binary arithmetic coder. Encoder and decoder update the same model in lockstep,
+so no model state is stored in the archive; it records only the segment size and
+model profile, so a file decodes identically regardless of the machine's CPU
+count or SIMD support.
 
-Large inputs are split into independent segments for parallel compression,
-incompressible regions are detected and stored raw, and texty input can pass
-through an adaptive word dictionary or reversible structured-data transforms.
+Large inputs are split into independent segments for parallel compression —
+except at level 9, which compresses the whole input as a single segment, because
+every split restarts the models from nothing and they keep learning well past
+any segment size worth using. Incompressible regions are detected and stored
+raw, and texty input can pass through an adaptive word dictionary or reversible
+structured-data transforms.
 
 ## Install
 
@@ -107,11 +112,22 @@ Levels trade speed, parallelism, memory, and ratio. Level 5 is the default.
 | 5 | 16 MiB | Full | Standard | Yes |
 | 6 | 32 MiB | Full | Standard | Yes |
 | 7 | 64 MiB | Full | Big | Yes |
-| 8–9 | 64 MiB | Full | Extra large | Yes |
+| 8 | 64 MiB | Full | Extra large | Yes |
+| 9 | whole input | Full | Maximum | Yes |
 
 High-entropy regions may be stored without context mixing at every level.
-Levels 7–9 can require substantial memory on large files; use level 5 or 6 on
-memory-constrained systems. Levels 8 and 9 currently use the same codec profile.
+
+Segment size is the ratio lever above level 4, and it does not flatten out where
+you might expect: on 64 MiB of enwik8, one segment beats four 16 MiB segments by
+5.1%. Level 9 therefore does not split at all. That buys the best ratio the
+engine can reach, and costs all of the parallelism — level 9 is single threaded
+whatever the file size — plus a lot of memory: about 9 GB on a 100 MB input and
+11 GB on a 1 GB one, since the model tables are sized for the segment.
+
+Levels 7 and 8 keep 64 MiB segments and compress them in parallel, so on a large
+file their peak memory is roughly 2.5 GB and 5 GB *per worker*. On a memory-
+constrained machine, cap the pool (`RAYON_NUM_THREADS=2`) or use level 5 or 6,
+whose models are a few tens of MB per worker.
 
 ## Desktop GUI
 
@@ -200,7 +216,7 @@ Full measurements and chart-generation scripts are in [`benchmarks/`](benchmarks
 ## Project status
 
 CPGC is experimental and its archive format is still evolving. The current
-decoder accepts format version 12 archives; retain a matching binary for older
+decoder accepts format version 13 archives; retain a matching binary for older
 archives. For important data, keep an independent copy and use `cpgc verify`
 after compression.
 

@@ -326,9 +326,12 @@ impl BhTable {
     /// the memory latencies overlap.
     #[inline]
     fn prefetch(&self, h: u32) {
+        // A 2- or 4-way set is 32 or 64 aligned bytes, so it never straddles a
+        // cache line and the second hint is free; at 8 ways it is the second
+        // line.
         let i0 = ((h & self.mask & !(self.ways - 1)) as usize) * BUCKET;
         prefetch_ptr(unsafe { self.t.as_ptr().add(i0) });
-        prefetch_ptr(unsafe { self.t.as_ptr().add(i0 + BUCKET * 2) });
+        prefetch_ptr(unsafe { self.t.as_ptr().add(i0 + (self.ways as usize - 1) * BUCKET) });
     }
 
     /// Find (or allocate) the bucket for hash `h`; returns the byte offset of
