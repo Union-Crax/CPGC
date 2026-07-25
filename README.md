@@ -161,8 +161,8 @@ and test actions for `.cpgc` and `.cpas` archives.
 ### enwik8
 
 [enwik8](https://mattmahoney.net/dc/textdata.html) is the first 100 MB of the
-English Wikipedia dump, a standard text-compression benchmark. CPGC's best
-result on it is level 8's **18,535,007 bytes (1.483 bpc)** — smaller than every
+English Wikipedia dump, a standard text-compression benchmark. At level 9 CPGC
+compresses it to **18,122,756 bytes (1.450 bpc)** — smaller than every
 general-purpose codec below; the research compressors zpaq, PAQ8, and cmix
 still lead. Every archive was round-trip decompressed and CRC-verified.
 
@@ -181,17 +181,14 @@ The nine levels trade compress time for ratio:
 | 5 | 20,016,786 B | 1.601 | 192 s | 196 s |
 | 6 | 19,712,978 B | 1.577 | 192 s | 194 s |
 | 7 | 18,671,295 B | 1.494 | 458 s | 463 s |
-| 8 | **18,535,007 B** | **1.483** | 521 s | 529 s |
-| 9 | 18,543,919 B | 1.484 | 769 s | 781 s |
+| 8 | 18,535,007 B | 1.483 | 521 s | 529 s |
+| 9 | **18,122,756 B** | **1.450** | 784 s | 786 s |
 
 Measured on a four-core container.
 
-enwik8 is small enough that level 9's single segment barely widens the window:
-level 8 already covers the file in two segments, so level 9 gains 33 MB of extra
-history and gives back about as much to table pressure. The two land within
-0.05% of each other, and level 9 costs 48% more time because it cannot use more
-than one core. Level 9 is for inputs large enough that level 8 would split them
-many times over — see enwik9 below.
+Level 9 buys 2.2% over level 8 here and costs 50% more time, because it cannot
+use more than one core. Its advantage grows with the file: the wider the window
+level 8 would have split, the more level 9 wins.
 
 ### enwik9
 
