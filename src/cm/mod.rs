@@ -212,6 +212,56 @@ pub fn decode_with_control(payload: &[u8], n: usize, ctrl: &Control) -> Option<V
     decode_framed(payload, n, ctrl)
 }
 
+/// How many segments may be in flight at once, given what one segment's model
+/// costs and how much memory the machine actually has.
+///
+/// This matters from level 7 up and is decisive at level 9, whose models run to
+/// several gigabytes each: one worker per core would ask for tens of gigabytes
+/// and be killed. Segments are independent, so this only changes how the work
+/// is scheduled — never the bytes produced.
+fn max_workers(seg_len: usize, turbo: bool, mem: u8) -> usize {
+    let cores = rayon::current_num_threads().max(1);
+    let per_worker = predictor::model_bytes(seg_len, turbo, mem);
+    if per_worker == 0 {
+        return cores;
+    }
+    // Leave a third of the budget for the input, the output and the allocator.
+    let budget = available_memory().saturating_mul(2) / 3;
+    let fits = (budget / per_worker).max(1) as usize;
+    fits.min(cores)
+}
+
+/// Memory the machine can actually hand out right now, in bytes. Falls back to
+/// a deliberately modest 4 GiB where it cannot be read, so an unknown platform
+/// errs towards fewer, larger-memory workers rather than being killed.
+fn available_memory() -> usize {
+    #[cfg(target_os = "linux")]
+    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("MemAvailable:") {
+                if let Some(kb) = rest.split_whitespace().next() {
+                    if let Ok(kb) = kb.parse::<usize>() {
+                        return kb.saturating_mul(1024);
+                    }
+                }
+            }
+        }
+    }
+    4 << 30
+}
+
+/// Run `f` on a pool of at most `workers` threads. One worker still needs a
+/// pool of its own: the caller may be inside rayon's global pool already.
+fn with_workers<R: Send>(workers: usize, f: impl FnOnce() -> R + Send) -> R {
+    if workers >= rayon::current_num_threads() {
+        return f();
+    }
+    match rayon::ThreadPoolBuilder::new().num_threads(workers).build() {
+        Ok(pool) => pool.install(f),
+        Err(_) => f(),
+    }
+}
+
 // How often (in bytes) a worker checks the control flag and publishes progress.
 // Batching keeps the shared atomic cheap on the hot encode/decode loop.
 const CHECK_INTERVAL: usize = 1 << 12; // 4 KiB
@@ -233,10 +283,12 @@ fn encode_framed(
 
     // Compress each segment independently, in parallel. A cancelled segment
     // yields `None`, which collapses the whole result to `None`.
-    let segments: Option<Vec<Vec<u8>>> = data
-        .par_chunks(seg_size)
-        .map(|chunk| encode_segment(chunk, turbo, mem, ctrl))
-        .collect();
+    let workers = max_workers(seg_size.min(data.len()), turbo, mem);
+    let segments: Option<Vec<Vec<u8>>> = with_workers(workers, || {
+        data.par_chunks(seg_size)
+            .map(|chunk| encode_segment(chunk, turbo, mem, ctrl))
+            .collect()
+    });
     let segments = segments?;
 
     let n_seg = segments.len();
@@ -293,10 +345,12 @@ fn decode_framed(payload: &[u8], n: usize, ctrl: &Control) -> Option<Vec<u8>> {
     }
 
     // Decode segments in parallel, then concatenate in order.
-    let parts: Option<Vec<Vec<u8>>> = jobs
-        .par_iter()
-        .map(|&(p, len)| decode_segment(p, len, turbo, mem, ctrl))
-        .collect();
+    let workers = max_workers(seg_size.min(n), turbo, mem);
+    let parts: Option<Vec<Vec<u8>>> = with_workers(workers, || {
+        jobs.par_iter()
+            .map(|&(p, len)| decode_segment(p, len, turbo, mem, ctrl))
+            .collect()
+    });
     let mut parts = parts?;
 
     // Level 9 produces a single segment, and there the concatenation buffer
