@@ -177,6 +177,39 @@ const MODEL_CAP: [u32; NBH] = [
     31,             // word trigram
 ];
 
+/// Roughly how many bytes one [`Predictor`] over an `n`-byte segment will
+/// allocate. Used to decide how many segments may be worked on at once: the
+/// top profiles build multi-gigabyte tables, and running one per core would
+/// exhaust any machine. Only the large allocations are counted, which is every
+/// one that matters at these sizes.
+pub fn model_bytes(n: usize, turbo: bool, mem: u8) -> usize {
+    let nbh = if turbo { NBH_TURBO } else { NBH };
+    let mem = if turbo { MEM_STD } else { mem };
+    let mut total: usize = (0..nbh)
+        .map(|k| BUCKET << model_bits(k, n, mem))
+        .sum();
+
+    // Match tables: two u32 tables, sized like Predictor::new does it.
+    let mbits = if mem >= MEM_BIG {
+        raw_bits(n).clamp(
+            HBITS_MIN,
+            24 + (mem >= MEM_PLUS) as u32 + (mem >= MEM_HUGE) as u32,
+        )
+    } else {
+        table_bits(n)
+    };
+    total += 2 * 4 * (1usize << mbits);
+
+    // Indirect byte tables, the mixer weight banks and the order-6 SSE stage.
+    let ind_bits: u32 = if mem >= MEM_BIG { 22 } else { 20 };
+    total += (1usize << 16) + 3 * (1usize << ind_bits);
+    let mix_rows = mix_rows_for(n, turbo, mem);
+    total += 3 * mix_rows * NINP * 4 + mix_rows * 33 * 2;
+
+    // The segment's own byte history.
+    total + n
+}
+
 // Memory profiles (recorded in the payload so decode always agrees).
 pub const MEM_STD: u8 = 0;
 pub const MEM_BIG: u8 = 1; // levels 7+: up to 2^23-bucket hash tables
@@ -485,6 +518,23 @@ const WC_ROWS: usize = 8192;
 const WC_ROWS_BIG: usize = 1 << 16;
 const WC_ROWS_PLUS: usize = 1 << 18;
 const WC_ROWS_HUGE: usize = 1 << 19;
+
+/// Rows in each hash-selected first-layer weight bank, for an `n`-byte segment.
+fn mix_rows_for(n: usize, turbo: bool, mem: u8) -> usize {
+    if turbo {
+        return WC_ROWS;
+    }
+    let by_profile = match mem {
+        MEM_STD => WC_ROWS,
+        MEM_BIG => WC_ROWS_BIG,
+        MEM_PLUS => WC_ROWS_PLUS,
+        _ => WC_ROWS_HUGE,
+    };
+    // A row that is never selected only wastes memory, so never exceed what
+    // the segment can plausibly train.
+    let by_input = (n / 64).next_power_of_two().max(WC_ROWS);
+    (tunable("CPGC_MIX_ROWS", by_profile.min(by_input) as i32) as usize).next_power_of_two()
+}
 
 // Second-layer mixer: combines the six first-layer outputs plus a bias.
 const NMIX: usize = 7;
@@ -807,19 +857,7 @@ impl Predictor {
 
         // Rows in each context-selected first-layer weight bank. Turbo never
         // uses the hashed views, so it keeps the smallest bank.
-        let mix_rows = if turbo {
-            WC_ROWS
-        } else {
-            let by_profile = match mem {
-                MEM_STD => WC_ROWS,
-                MEM_BIG => WC_ROWS_BIG,
-                MEM_PLUS => WC_ROWS_PLUS,
-                _ => WC_ROWS_HUGE,
-            };
-            let by_input = (n / 64).next_power_of_two().max(WC_ROWS);
-            (tunable("CPGC_MIX_ROWS", by_profile.min(by_input) as i32) as usize)
-                .next_power_of_two()
-        };
+        let mix_rows = mix_rows_for(n, turbo, mem);
 
         // Set associativity of the bit-history tables. More ways means fewer
         // contexts evicted by an unlucky hash, which matters most when the
