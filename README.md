@@ -194,20 +194,32 @@ level 8 would have split, the more level 9 wins.
 
 [enwik9](https://mattmahoney.net/dc/textdata.html) is the first 1 GB of the same
 dump — the Large Text Compression Benchmark and Hutter Prize file. At level 9
-CPGC reaches **162,750,488 bytes (1.302 bpc)**. Every archive was round-trip
-decompressed and CRC-verified.
+CPGC reaches **153,298,285 bytes (1.226 bpc)**, 5.8% smaller than the previous
+release. Every archive was round-trip decompressed and CRC-verified.
 
 ![enwik9 compressed size vs other tools](benchmarks/enwik9_sizes.png)
 
 | Level | Compressed size | Bits/byte | Compress | Decompress |
 |---:|---:|---:|---:|---:|
-| 1 | 205,709,828 B | 1.646 | 5 min | 4 min |
-| 3 | 191,988,449 B | 1.536 | 4 min | 4 min |
-| 5 | 174,851,769 B | 1.399 | 19 min | 19 min |
-| 9 | **162,750,488 B** | **1.302** | 33 min | 34 min |
+| 9 | **153,298,285 B** | **1.226** | 124 min | 128 min |
 
-Same four-core container; level 9 was capped at three workers to fit its models
-within 15 GB of RAM.
+Four-core container, 15 GB of RAM. Level 9 splits enwik9 into four 256 MiB
+segments and, on this machine, works on one at a time — the worker count is
+derived from what a segment's models actually allocate against available
+memory, so a larger machine uses more cores for the same output.
+
+This puts CPGC ahead of every general-purpose codec on the file and behind the
+research compressors: zpaq -m5 reaches 142,252,605, paq8px 126,486,867 and cmix
+107,963,380. The gap to zpaq is about 7.8%.
+
+The measurements say where the remaining headroom is, and it is memory rather
+than modelling. Each doubling of the segment paid — over the first 256 MB of
+enwik9, four 64 MiB segments give 48,491,970 bytes, two 128 MiB give 47,851,150
+and one 256 MB gives 45,980,493 — right up until the tables stopped keeping up.
+They cap at 2^25 buckets, which is 136 bytes of input per context slot at
+256 MiB; at 1 GiB it is 531, and a single-segment enwik9 comes out at
+168,708,258, *worse* than splitting it. Going wider needs 2^26-bucket tables,
+about 11 GB of model against the 8 GB that fits here.
 
 Full measurements and chart-generation scripts are in [`benchmarks/`](benchmarks/):
 
