@@ -40,9 +40,10 @@
 //! Splitting is not free: every segment restarts the model from nothing, and
 //! the models keep learning for as long as you let them. On 64 MiB of enwik8,
 //! one segment beats four 16 MiB segments by 5.1%. The segment size is
-//! therefore the main ratio lever above level 4, and level 9 gives it up
-//! entirely — it compresses the whole input as a single segment, single
-//! threaded, for the best ratio the engine can reach.
+//! therefore the main ratio lever above level 4 — but only up to the point
+//! where the hashed tables stop being able to hold a segment's contexts. Past
+//! that the window turns against you. Level 9 sits at that point, at 256 MiB;
+//! see [`seg_size_for_level`].
 //!
 //! Encoder and decoder run the identical model in lockstep, so the model is
 //! never stored. Because both sides execute the same deterministic code, hash
@@ -123,15 +124,22 @@ pub const SEG_SIZE: usize = 16 << 20; // 16 MiB == level 5
 /// ratio cost. The chosen size is stored in the payload, so decoding never
 /// depends on this mapping.
 ///
-/// Segment size is the dominant ratio lever on large text, and it stays that
-/// way well past the 64 MiB where an earlier measurement had suggested it
-/// flattened out. Re-measured on 64 MiB of enwik8 with the current tables, one
-/// segment beats four 16 MiB segments by 5.1% — the models simply keep
-/// learning, and every restart throws that away. So level 9 does not split at
-/// all: it compresses the whole input as a single segment, trading all
-/// parallelism (and a lot of memory) for the best ratio the engine can reach.
+/// Segment size is the dominant ratio lever on large text, and it keeps paying
+/// well past the 64 MiB an earlier measurement had settled on — but only as far
+/// as the model tables can follow it.
 ///
-/// Levels 1-8 still split, so they scale across cores.
+/// Measured on enwik9 with the current tables: over the first 256 MB, four
+/// 64 MiB segments give 48,491,970 bytes, two 128 MiB segments 47,851,150, and
+/// one 256 MB segment 45,980,493 — every doubling of the window pays. Past that
+/// it reverses, and hard: the hashed tables cap at 2^25 buckets whatever the
+/// segment size, so a 1 GB segment crowds four times harder than a 256 MB one
+/// (531 bytes of input per context slot against 136). Compressed as a single
+/// segment, enwik9 came out at 168,708,258 bytes — worse than splitting it, and
+/// worse than the previous release.
+///
+/// So level 9 uses the largest window the tables can actually support. Going
+/// wider is a memory question rather than a segmentation one: it needs
+/// 2^26-bucket tables, roughly 11 GB of model.
 pub fn seg_size_for_level(level: u8) -> usize {
     let bits: u32 = match level {
         0 | 1 => 20, // 1 MiB
@@ -141,13 +149,12 @@ pub fn seg_size_for_level(level: u8) -> usize {
         5 => 24, // 16 MiB (default)
         6 => 25,
         7 | 8 => 26, // 64 MiB
-        _ => return MAX_SEG, // level 9: one segment for the whole input
+        _ => 28,     // 256 MiB
     };
     1usize << bits
 }
 
-/// Largest segment the payload's u32 segment-size field can describe. Inputs
-/// past this still split, even at level 9.
+/// Largest segment the payload's u32 segment-size field can describe.
 pub const MAX_SEG: usize = 1 << 31;
 
 /// Compress `data` into a self-contained CPGC-NX payload at the given level.

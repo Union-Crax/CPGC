@@ -18,11 +18,11 @@ so no model state is stored in the archive; it records only the segment size and
 model profile, so a file decodes identically regardless of the machine's CPU
 count or SIMD support.
 
-Large inputs are split into independent segments for parallel compression —
-except at level 9, which compresses the whole input as a single segment, because
-every split restarts the models from nothing and they keep learning well past
-any segment size worth using. Incompressible regions are detected and stored
-raw, and texty input can pass through an adaptive word dictionary or reversible
+Large inputs are split into independent segments for parallel compression, with
+the segment size rising with the level — every split restarts the models from
+nothing, so a wider window compresses better, up to the point where the model
+tables can no longer hold a segment's contexts. Incompressible regions are
+detected and stored raw, and texty input can pass through an adaptive word dictionary or reversible
 structured-data transforms.
 
 ## Install
@@ -113,16 +113,18 @@ Levels trade speed, parallelism, memory, and ratio. Level 5 is the default.
 | 6 | 32 MiB | Full | Standard | Yes |
 | 7 | 64 MiB | Full | Big | Yes |
 | 8 | 64 MiB | Full | Extra large | Yes |
-| 9 | whole input | Full | Maximum | Yes |
+| 9 | 256 MiB | Full | Maximum | Yes |
 
 High-entropy regions may be stored without context mixing at every level.
 
 Segment size is the ratio lever above level 4, and it does not flatten out where
 you might expect: on 64 MiB of enwik8, one segment beats four 16 MiB segments by
-5.1%. Level 9 therefore does not split at all. That buys the best ratio the
-engine can reach, and costs all of the parallelism — level 9 is single threaded
-whatever the file size — plus a lot of memory: about 9 GB on a 100 MB input and
-11 GB on a 1 GB one, since the model tables are sized for the segment.
+5.1%. It does eventually stop paying, though, and level 9 sits at that point
+rather than past it. The hashed tables cap at 2^25 buckets whatever the segment
+size, so a 256 MiB segment holds about 136 bytes of input per context slot while
+a 1 GiB one holds 531 — and compressed as a single 1 GB segment, enwik9 comes out
+*worse* than splitting it. Level 9 therefore uses 256 MiB segments, the widest
+window the tables can support, at about 8 GB of model per segment.
 
 Levels 7 and 8 keep 64 MiB segments and compress them in parallel, so on a large
 file their peak memory is roughly 2.5 GB and 5 GB *per worker*. On a memory-
@@ -186,28 +188,35 @@ The nine levels trade compress time for ratio:
 
 Measured on a four-core container.
 
-Level 9 buys 2.2% over level 8 here and costs 50% more time, because it cannot
-use more than one core. Its advantage grows with the file: the wider the window
-level 8 would have split, the more level 9 wins.
+Level 9 buys 2.2% over level 8 here and costs 50% more time. On a 100 MB input
+it is a single segment, so it cannot use more than one core; on larger files it
+splits at 256 MiB and parallelises again as memory allows.
 
 ### enwik9
 
 [enwik9](https://mattmahoney.net/dc/textdata.html) is the first 1 GB of the same
 dump — the Large Text Compression Benchmark and Hutter Prize file. At level 9
-CPGC reaches **162,750,488 bytes (1.302 bpc)**. Every archive was round-trip
-decompressed and CRC-verified.
+CPGC reaches **153,298,285 bytes (1.226 bpc)**, 5.8% smaller than the previous
+release. The archive was round-trip decompressed and CRC-verified.
 
 ![enwik9 compressed size vs other tools](benchmarks/enwik9_sizes.png)
 
 | Level | Compressed size | Bits/byte | Compress | Decompress |
 |---:|---:|---:|---:|---:|
-| 1 | 205,709,828 B | 1.646 | 5 min | 4 min |
-| 3 | 191,988,449 B | 1.536 | 4 min | 4 min |
-| 5 | 174,851,769 B | 1.399 | 19 min | 19 min |
-| 9 | **162,750,488 B** | **1.302** | 33 min | 34 min |
+| 9 | **153,298,285 B** | **1.226** | 124 min | 128 min |
 
-Same four-core container; level 9 was capped at three workers to fit its models
-within 15 GB of RAM.
+Four-core container with 15 GB of RAM; level 9 splits enwik9 into four 256 MiB
+segments and runs them one at a time to stay inside that budget.
+
+That places CPGC ahead of every general-purpose codec on this file and behind
+the research compressors — zpaq -m5 reaches 142,252,605, paq8px 126,486,867 and
+cmix 107,963,380. The gap to zpaq is about 7.8%.
+
+The remaining headroom is memory rather than modelling. Every doubling of the
+window paid — over the first 256 MB of enwik9, four 64 MiB segments give
+48,491,970 bytes, two 128 MiB give 47,851,150, one 256 MB gives 45,980,493 —
+until the tables stopped keeping up. Widening further needs 2^26-bucket tables,
+roughly 11 GB of model against the 8 GB that fits here.
 
 Full measurements and chart-generation scripts are in [`benchmarks/`](benchmarks/):
 
