@@ -126,10 +126,13 @@ a 1 GiB one holds 531 — and compressed as a single 1 GB segment, enwik9 comes 
 *worse* than splitting it. Level 9 therefore uses 256 MiB segments, the widest
 window the tables can support, at about 8 GB of model per segment.
 
-Levels 7 and 8 keep 64 MiB segments and compress them in parallel, so on a large
-file their peak memory is roughly 2.5 GB and 5 GB *per worker*. On a memory-
-constrained machine, cap the pool (`RAYON_NUM_THREADS=2`) or use level 5 or 6,
-whose models are a few tens of MB per worker.
+Levels 7 and above carry large models — roughly 2.5 GB, 5 GB and 8 GB per
+segment at levels 7, 8 and 9 — so CPGC works out how many segments it can afford
+to have in flight from the models' actual size and the machine's available
+memory, rather than starting one per core. That only changes scheduling, never
+the bytes produced: a machine with the memory to spare uses every core, and a
+smaller one uses fewer workers instead of being killed. Levels 5 and 6 are a few
+tens of MB per worker and always parallelise fully.
 
 ## Desktop GUI
 
