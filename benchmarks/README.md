@@ -204,17 +204,27 @@ The 19 that do bind split in two, and the distinction is what matters:
   Raising these cannot help — the extra table is unaddressable by construction.
 * **Six are judgements** — order-3, indirect order-3 and order-4, case-folded
   order-3, the enclosing element and the line shape. All are open-ended in real
-  text, and all sit at `CAP_OPEN`, currently 24, purely because that seemed like
-  enough table to spend. These are the ones worth moving, and moving them is
-  cheap: **+1 bit on the whole tier is 1.5 GiB per segment against 6 GiB for the
-  clamp.** They are grouped under `CAP_OPEN` in `src/cm/predictor.rs` and the
-  tier moves as a unit via `CPGC_CAP_OPEN` under the `tune` feature, so the
-  experiment needs no code change:
+  text, and all sit at `CAP_OPEN`, currently 24, because that seemed like enough
+  table to spend. They are grouped under that name in `src/cm/predictor.rs` and
+  move as a unit via `CPGC_CAP_OPEN` under the `tune` feature.
 
-```sh
-cargo build --release --features tune --bin cpgc
-CPGC_CAP_OPEN=25 ./target/release/cpgc compress <256 MiB slice> out.cpgc -l 9
-```
+  **This tier has been measured and it is not the lever.** On the first 256 MiB
+  of enwik9 as a single segment — what level 9 actually runs — raising the whole
+  tier by a bit is worth 2,286 bytes:
+
+  | `CAP_OPEN` | Compressed | bpc |
+  |---:|---:|---:|
+  | 24 (current) | 45,980,493 | 1.3703 |
+  | 25 | 45,978,207 | 1.3703 |
+
+  That is 0.005% for 1.5 GiB per segment. These six caps were already adequate;
+  raising them is not a cheap substitute for the clamp, it is simply no gain.
+  The reasoning that made it look promising — "nineteen models bind here, so
+  this is where the crowding is" — was wrong, and the thirteen arithmetic caps
+  above are why: most of that nineteen could never have been short of table.
+
+So all of the crowding sits in the eleven clamp-bound models, and buying them
+more table costs the full 6 GiB with no cheaper path to the same place.
 
 Note that this changes the format: the profile byte is recorded in the payload,
 so archives written with a larger profile need a decoder that knows it. Bump

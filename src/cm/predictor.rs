@@ -126,8 +126,9 @@ fn model_bits(k: usize, n: usize, mem: u8) -> u32 {
     // a single 100 MB segment carries the same per-byte table pressure as
     // two 50 MB segments, while keeping the longer match window.
     let plus = (mem >= MEM_PLUS) as u32 + (mem >= MEM_HUGE) as u32;
+    let ceiling = tunable("CPGC_CLAMP", (23 + plus) as i32).clamp(11, 28) as u32;
     let bits = if mem >= MEM_BIG {
-        raw_bits(n).clamp(11, 23 + plus)
+        raw_bits(n).clamp(11, ceiling)
     } else {
         // The standard profile is sized to stay small, so the low-cardinality
         // kinds are clamped harder than their populations alone would need.
