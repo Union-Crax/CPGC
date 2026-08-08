@@ -226,7 +226,10 @@ Full measurements and chart-generation scripts are in [`benchmarks/`](benchmarks
 - [`results.csv`](benchmarks/results.csv) — complete enwik8 level sweep
 - [`enwik9_results.csv`](benchmarks/enwik9_results.csv) — enwik9 results
 - [`make_charts.py`](benchmarks/make_charts.py) — reproducible charts
-- [`run_bench.sh`](benchmarks/run_bench.sh) — benchmark runner
+- [`run_bench.sh`](benchmarks/run_bench.sh) — enwik8 runner
+- [`run_bench9.sh`](benchmarks/run_bench9.sh) — enwik9 runner
+- [`README.md`](benchmarks/README.md) — how to reproduce these numbers, what
+  each level costs in memory, and where the remaining ratio headroom is
 
 ## Project status
 
