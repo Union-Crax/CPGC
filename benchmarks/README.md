@@ -34,15 +34,14 @@ matching, something is wrong.
    worker and the machine had 14.6 GB. Read that section before starting — the
    memory estimate it used to carry was low by a third, and there is a much
    cheaper variant of the same experiment worth doing first.
-2. **Re-check `CPGC_MIX_LR` at 256 MiB.** The warning at the bottom of this file
-   says the right learning rate falls as segments grow, and gives 3 for anything
-   above 64 MiB. Level 9 now runs 256 MiB segments — four times the size at
-   which that 3 was established. Nobody has confirmed 3 is still right there, and
-   the same warning documents a 5.3% cost for getting it wrong. This is cheap to
-   test and the most likely free win.
-3. **`MODEL_CAP` ceilings.** Nineteen of the thirty models never reach the
-   profile clamp, so the global ceiling is not what binds them. Selective raises
-   are cheaper than a whole new profile.
+2. **`MODEL_CAP`'s open tier.** Nineteen of the thirty models never reach the
+   profile clamp, so the global ceiling is not what binds them — but thirteen of
+   those nineteen are capped by arithmetic, not judgement, and raising them buys
+   nothing. Only six are open-ended. See [The open lever](#the-open-lever-table-size).
+
+`CPGC_MIX_LR` at 256 MiB is **not** open — it was measured at exactly that
+segment size, three rates, before level 9 was set there. See the rate section
+at the bottom; 3 is confirmed, and both neighbours are much worse.
 
 Two practical notes for whoever picks this up. Levels 8 and 9 on enwik9 run for
 hours — budget most of a day for a full re-measure, and split the level list
@@ -188,12 +187,34 @@ against unchanged tables is the regression described above.
 
 Worth knowing before you spend the memory: at `MEM_HUGE` on a 256 MiB segment
 the clamp yields 25 bits, but only 11 of the 30 models are uncapped enough to
-use it. Six bind at `MODEL_CAP` 24 and ten at 21. So raising the global ceiling
-buys nothing for 19 of the 30 models, and essentially all of the extra 6 GiB
-goes to doubling the tables of the eleven high-cardinality ones (orders 3–7,
-word, word-pair, orders 8/10/12/16, word trigram). If that is where the win is,
-raising those `MODEL_CAP` entries selectively is the same experiment at a
-fraction of the memory — and worth trying first.
+use it. The other 19 bind at `MODEL_CAP`, so raising the global ceiling buys
+them nothing and essentially all of the extra 6 GiB goes to doubling those
+eleven (orders 4–7, word, word-pair, orders 8/10/12/16, word trigram).
+
+Those eleven cannot be reached more cheaply, though — their `MODEL_CAP` entries
+are already 31, i.e. no cap at all, so the clamp is the *only* thing limiting
+them and raising their caps selectively is a no-op. Buying them more table means
+paying the full 6 GiB.
+
+The 19 that do bind split in two, and the distinction is what matters:
+
+* **Thirteen are arithmetic.** An order-2 context has exactly 65,536 values, a
+  stride lane 65,536, the nesting context 16,384. Multiply by the 17 buckets a
+  context touches and their caps (21, 21, 19) are the population, not a guess.
+  Raising these cannot help — the extra table is unaddressable by construction.
+* **Six are judgements** — order-3, indirect order-3 and order-4, case-folded
+  order-3, the enclosing element and the line shape. All are open-ended in real
+  text, and all sit at `CAP_OPEN`, currently 24, purely because that seemed like
+  enough table to spend. These are the ones worth moving, and moving them is
+  cheap: **+1 bit on the whole tier is 1.5 GiB per segment against 6 GiB for the
+  clamp.** They are grouped under `CAP_OPEN` in `src/cm/predictor.rs` and the
+  tier moves as a unit via `CPGC_CAP_OPEN` under the `tune` feature, so the
+  experiment needs no code change:
+
+```sh
+cargo build --release --features tune --bin cpgc
+CPGC_CAP_OPEN=25 ./target/release/cpgc compress <256 MiB slice> out.cpgc -l 9
+```
 
 Note that this changes the format: the profile byte is recorded in the payload,
 so archives written with a larger profile need a decoder that knows it. Bump
@@ -232,3 +253,19 @@ above. Tuning it on small slices and applying the result to large segments costs
 wrong rate, one 128 MiB segment looks 2.7% *worse* than two 64 MiB ones when it
 is actually 2.7% better. Any model parameter tuned on a 16 MiB slice should be
 re-checked at the segment size it will actually run at.
+
+That re-check has been done for the size level 9 actually uses. On the first
+256 MiB of enwik9 as a single segment — the exact configuration level 9 runs —
+all three candidate rates were measured:
+
+| `CPGC_MIX_LR` | Compressed |
+|---:|---:|
+| 4 | 53,352,426 |
+| **3** | **45,980,493** |
+| 2 | 48,252,748 |
+
+Rate 3 wins by 4.9% over its nearer neighbour, so the schedule is confirmed at
+the size that matters and this is not an open question. What has *not* been
+checked is a segment larger than 256 MiB, which only becomes reachable if the
+table ceiling moves — and if it does, the rate must be re-swept there, because
+that is precisely the mistake this warning is about.

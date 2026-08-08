@@ -141,7 +141,14 @@ fn model_bits(k: usize, n: usize, mem: u8) -> u32 {
             Kind::Ind => h.min(18),
         }
     };
-    bits.min(MODEL_CAP[k])
+    let cap = MODEL_CAP[k];
+    // The open tier can be moved as a group for table-size experiments.
+    let cap = if cap == CAP_OPEN {
+        tunable("CPGC_CAP_OPEN", CAP_OPEN as i32).clamp(11, 28) as u32
+    } else {
+        cap
+    };
+    bits.min(cap)
 }
 
 /// Per-model ceiling on bucket-count exponent: how large a table the model's
@@ -159,21 +166,31 @@ fn model_bits(k: usize, n: usize, mem: u8) -> u32 {
 /// pays for the much larger tables the high-order, word and indirect models
 /// get in the top profiles. Those are the ones that actually thrash: on a
 /// 1 GB segment they see hundreds of millions of distinct contexts.
+/// Cap for the models whose context population is *not* bounded by
+/// construction. Every other entry in `MODEL_CAP` is arithmetic — an order-2
+/// context has 65,536 values and that is that — but these six are open-ended in
+/// real text, so their ceiling is a judgement about how much table is worth
+/// spending rather than a fact. Grouped under one name so the whole tier can be
+/// moved together, which is much cheaper than raising the profile clamp:
+/// +1 bit here is 1.5 GiB per segment against 6 GiB for the clamp, and the
+/// clamp does nothing for these models at all.
+const CAP_OPEN: u32 = 24;
+
 const MODEL_CAP: [u32; NBH] = [
-    21, 24, 31, 31, // orders 2-5
+    21, CAP_OPEN, 31, 31, // orders 2-5
     31,             // word
     31, 31,         // orders 6-7
     31,             // word pair
     14, 14,         // sparse: one byte of context each
     21, 21, 21, 21, // sparse: two bytes of context each
     21, 21, 21, 21, // strides: two samples of one lane
-    21, 24, 24,     // indirect order-2, -3, -4
+    21, CAP_OPEN, CAP_OPEN, // indirect order-2, -3, -4
     31, 31,         // orders 8, 10
     31, 31,         // orders 12, 16
-    24,             // case-folded order-3
-    24,             // enclosing element
+    CAP_OPEN,       // case-folded order-3
+    CAP_OPEN,       // enclosing element
     19,             // bracket nesting: delimiter x depth x previous byte
-    24,             // line shape
+    CAP_OPEN,       // line shape
     31,             // word trigram
 ];
 
