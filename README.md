@@ -206,10 +206,17 @@ release. The archive was round-trip decompressed and CRC-verified.
 
 | Level | Compressed size | Bits/byte | Compress | Decompress |
 |---:|---:|---:|---:|---:|
-| 9 | **153,298,285 B** | **1.226** | 124 min | 128 min |
+| 1 | 205,528,124 B | 1.644 | 2 min | 2 min |
+| 3 | 191,638,802 B | 1.533 | 3 min | 2 min |
+| 5 | 172,544,182 B | 1.380 | 14 min | 12 min |
+| 8 | 158,556,042 B | 1.268 | 56 min | 56 min |
+| 9 | **153,298,285 B** | **1.226** | 107 min | 113 min |
 
-Four-core container with 15 GB of RAM; level 9 splits enwik9 into four 256 MiB
-segments and runs them one at a time to stay inside that budget.
+Sixteen-core desktop with 32 GB of RAM. Level 9 splits enwik9 into four 256 MiB
+segments and, at about 8.6 GB of model each, still runs them one at a time to
+stay inside that budget; level 8's smaller models allowed two at once. Level 9's
+byte count is identical to the one first measured on a four-core container with
+15 GB — the scheduling changes, the output does not.
 
 That places CPGC ahead of every general-purpose codec on this file and behind
 the research compressors — zpaq -m5 reaches 142,252,605, paq8px 126,486,867 and

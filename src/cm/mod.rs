@@ -234,6 +234,9 @@ fn max_workers(seg_len: usize, turbo: bool, mem: u8) -> usize {
 /// Memory the machine can actually hand out right now, in bytes. Falls back to
 /// a deliberately modest 4 GiB where it cannot be read, so an unknown platform
 /// errs towards fewer, larger-memory workers rather than being killed.
+///
+/// This only ever changes how many segments are scheduled at once, never what
+/// they encode to, so a wrong answer here costs time and nothing else.
 fn available_memory() -> usize {
     #[cfg(target_os = "linux")]
     if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
@@ -247,6 +250,35 @@ fn available_memory() -> usize {
             }
         }
     }
+
+    // Windows has no /proc, and without this a 32 GB desktop took the 4 GiB
+    // fallback and ran levels 8-9 one segment at a time. `ullAvailPhys` counts
+    // free plus standby pages, which is the same thing `MemAvailable` reports.
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct MemoryStatusEx {
+            length: u32,
+            memory_load: u32,
+            total_phys: u64,
+            avail_phys: u64,
+            total_page_file: u64,
+            avail_page_file: u64,
+            total_virtual: u64,
+            avail_virtual: u64,
+            avail_extended_virtual: u64,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+        }
+        let mut status: MemoryStatusEx = unsafe { std::mem::zeroed() };
+        status.length = std::mem::size_of::<MemoryStatusEx>() as u32;
+        if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 && status.avail_phys > 0 {
+            return status.avail_phys.min(usize::MAX as u64) as usize;
+        }
+    }
+
     4 << 30
 }
 
