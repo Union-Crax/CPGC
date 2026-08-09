@@ -28,16 +28,18 @@ matching, something is wrong.
 
 **What is still open, in the order I would try it:**
 
-1. **Table size** — the one known lever with several percent in it and no
-   modelling work. See [The open lever](#the-open-lever-table-size). It was not
-   run this pass purely for want of RAM: the 2^26 profile needs ~15 GB free per
-   worker and the machine had 14.6 GB. Read that section before starting — the
-   memory estimate it used to carry was low by a third, and there is a much
-   cheaper variant of the same experiment worth doing first.
-2. **`MODEL_CAP`'s open tier.** Nineteen of the thirty models never reach the
-   profile clamp, so the global ceiling is not what binds them — but thirteen of
-   those nineteen are capped by arithmetic, not judgement, and raising them buys
-   nothing. Only six are open-ended. See [The open lever](#the-open-lever-table-size).
+1. **512 MiB segments with 2^26 tables, together.** The one remaining
+   memory-side question, and it needs a machine that can hold ~15 GB per
+   segment. Note this is *not* the "several percent" the file used to promise:
+   the clamp has since been swept on its own and is worth about 0.4% at 2^26.
+   What is unmeasured is the combined change, because window has been the
+   stronger lever and 512 MiB falls in the gap between the last size that helped
+   (256 MiB) and the first that hurt (1 GB). See
+   [How much is actually left in it](#how-much-is-actually-left-in-it).
+2. **Modelling, not memory.** With the table lever measured and small, closing
+   more of the 7.8% gap to zpaq means new or better models rather than a bigger
+   machine. `MODEL_CAP`'s open tier and the profile clamp have both been swept
+   and are documented below; neither has much left.
 
 `CPGC_MIX_LR` at 256 MiB is **not** open — it was measured at exactly that
 segment size, three rates, before level 9 was set there. See the rate section
@@ -166,65 +168,41 @@ one gets 136. Compressed as a single 1 GB segment, enwik9 came out at
 168,708,258 bytes — worse than splitting it.
 
 So level 9 sits at 256 MiB because that is the widest window *these tables*
-support, not because the curve had flattened. **On a machine with more memory,
-raising the table ceiling should be worth several percent with no modelling
-change.** The ceiling is one expression, `model_bits` in
-`src/cm/predictor.rs`:
+support, not because the curve had flattened.
 
-```rust
-raw_bits(n).clamp(11, 23 + plus)   // plus == 2 at MEM_HUGE, so 2^25
-```
+### How much is actually left in it
 
-Raising the ceiling to 2^26 with a matching 512 MiB window (`seg_size_for_level`)
-costs **about 14.8 GiB of model per segment, not the ~11 GB this file used to
-estimate.** That is `model_bytes` evaluated for `plus == 3` at `n == 2^29`,
-computed rather than measured, but by the same method that predicted the two
-footprints above to within a few percent. Budget one worker per ~15 GB of real
-RAM; `max_workers` always schedules at least one segment however little memory
-it finds, so a machine that cannot hold the model will thrash rather than
-refuse. Both the ceiling and the window must move together — a wider window
-against unchanged tables is the regression described above.
+This used to say "should be worth several percent". It is not: the clamp has
+now been swept, and the answer is much smaller. Holding the window at the
+256 MiB level 9 runs and moving only the ceiling:
 
-Worth knowing before you spend the memory: at `MEM_HUGE` on a 256 MiB segment
-the clamp yields 25 bits, but only 11 of the 30 models are uncapped enough to
-use it. The other 19 bind at `MODEL_CAP`, so raising the global ceiling buys
-them nothing and essentially all of the extra 6 GiB goes to doubling those
-eleven (orders 4–7, word, word-pair, orders 8/10/12/16, word trigram).
+| Profile clamp | Compressed | bpc | vs current |
+|---:|---:|---:|---:|
+| 2^23 | 46,616,910 | 1.3893 | +1.38% |
+| 2^24 | 46,249,709 | 1.3783 | +0.59% |
+| **2^25** (current) | **45,980,493** | **1.3703** | — |
 
-Those eleven cannot be reached more cheaply, though — their `MODEL_CAP` entries
-are already 31, i.e. no cap at all, so the clamp is the *only* thing limiting
-them and raising their caps selectively is a no-op. Buying them more table means
-paying the full 6 GiB.
+Successive doublings return 0.79% then 0.59%, a ratio of about 0.75 each time.
+Extrapolating that decay, **2^26 is worth roughly 0.4% for its extra 6 GiB per
+segment**, and the entire remaining table lever — unlimited memory, same model —
+converges to somewhere near 1.7%. Worth having on a big machine; not worth
+reorganising the project around, and nothing like the figure this file carried
+on reasoning alone.
 
-The 19 that do bind split in two, and the distinction is what matters:
+Two honest caveats in the other direction. This sweep isolates table size at a
+fixed window, so it does not measure the configuration a bigger machine would
+actually run, which is 512 MiB segments *and* 2^26 tables together. Window has
+been the stronger lever throughout — at a fixed 2^25 clamp, one 256 MiB segment
+beats two 128 MiB ones by 3.9% — so the combined change could be worth
+noticeably more than 0.4%. But it could also be worth less than nothing: a
+single 1 GB segment at this clamp came out 3.66% *worse* than splitting, so the
+window turns against you somewhere between 256 MiB and 1 GB, and 512 MiB sits in
+that unmeasured gap. That one run is the experiment worth doing on hardware that
+can hold it — not the clamp on its own.
 
-* **Thirteen are arithmetic.** An order-2 context has exactly 65,536 values, a
-  stride lane 65,536, the nesting context 16,384. Multiply by the 17 buckets a
-  context touches and their caps (21, 21, 19) are the population, not a guess.
-  Raising these cannot help — the extra table is unaddressable by construction.
-* **Six are judgements** — order-3, indirect order-3 and order-4, case-folded
-  order-3, the enclosing element and the line shape. All are open-ended in real
-  text, and all sit at `CAP_OPEN`, currently 24, because that seemed like enough
-  table to spend. They are grouped under that name in `src/cm/predictor.rs` and
-  move as a unit via `CPGC_CAP_OPEN` under the `tune` feature.
-
-  **This tier has been measured and it is not the lever.** On the first 256 MiB
-  of enwik9 as a single segment — what level 9 actually runs — raising the whole
-  tier by a bit is worth 2,286 bytes:
-
-  | `CAP_OPEN` | Compressed | bpc |
-  |---:|---:|---:|
-  | 24 (current) | 45,980,493 | 1.3703 |
-  | 25 | 45,978,207 | 1.3703 |
-
-  That is 0.005% for 1.5 GiB per segment. These six caps were already adequate;
-  raising them is not a cheap substitute for the clamp, it is simply no gain.
-  The reasoning that made it look promising — "nineteen models bind here, so
-  this is where the crowding is" — was wrong, and the thirteen arithmetic caps
-  above are why: most of that nineteen could never have been short of table.
-
-So all of the crowding sits in the eleven clamp-bound models, and buying them
-more table costs the full 6 GiB with no cheaper path to the same place.
+The practical conclusion is that memory is no longer the interesting frontier
+here. Getting materially closer to zpaq (142,252,605, about 7.8% below the
+current result) means modelling work, not a bigger box.
 
 Note that this changes the format: the profile byte is recorded in the payload,
 so archives written with a larger profile need a decoder that knows it. Bump
