@@ -90,13 +90,6 @@ const HBITS_MIN: u32 = 14;
 
 const MATCH_MIN: usize = 4; // short-hash suffix length that seeds a new match
 const MATCH_MIN_LONG: usize = 8; // long-hash suffix length (tried first)
-// A second, independent match model anchored on a much longer suffix. The
-// first model always follows the *most recent* occurrence of a short suffix,
-// which on a Wikipedia dump is usually the nearest boilerplate rather than the
-// most informative one. Anchoring separately on 16 bytes finds a different,
-// rarer continuation, and the mixer gets two long-range opinions to weigh
-// instead of one.
-const MATCH_MIN_FAR: usize = 16;
 const MATCH_EMPTY: u32 = u32::MAX;
 
 // Two-speed coding: once a verified match reaches this length, whole bytes
@@ -200,10 +193,6 @@ const MODEL_CAP: [u32; NBH] = [
     19,             // bracket nesting: delimiter x depth x previous byte
     CAP_OPEN,       // line shape
     31,             // word trigram
-    CAP_OPEN,       // indirect word
-    31,             // element x word
-    21,             // numeric run: element x run length x last digits
-    CAP_OPEN,       // three-byte skip-gram
 ];
 
 /// Roughly how many bytes one [`Predictor`] over an `n`-byte segment will
@@ -484,19 +473,7 @@ const NTEXT: usize = 5; // order-8, order-10, order-12, order-16, case-folded or
 //     prefix, a genuine language model context that the word-pair model only
 //     approximates.
 const NMARKUP: usize = 4;
-// A second round aimed at what a Wikipedia dump actually contains, rather than
-// at text in general:
-//   * indirect word — the byte that last followed this word *prefix*, a
-//     word-completion cue the word model itself cannot express;
-//   * element x word — `<title>` vocabulary is not body vocabulary, and neither
-//     the element model nor the word model sees the product;
-//   * numeric run — page ids, revision ids and ISO timestamps are a large
-//     fraction of the file, and a digit inside a run is predicted by how far
-//     into the run it is and which element encloses it;
-//   * a three-byte skip-gram, reaching past the two-byte sparse contexts.
-const NEXTRA: usize = 4;
-const NBH: usize =
-    NHASH + NSPARSE + NSTRIDE + NIND + NTEXT + NMARKUP + NEXTRA; // 34 models
+const NBH: usize = NHASH + NSPARSE + NSTRIDE + NIND + NTEXT + NMARKUP; // 30 models
 
 // Per-model table kind, indexed like `bh_base`: how big a hash table the
 // model's context population deserves.
@@ -522,10 +499,6 @@ const MODEL_KIND: [Kind; NBH] = [
     Kind::Sparse,                                   // bracket nesting
     Kind::Sparse,                                   // line shape
     Kind::Hash,                                     // word trigram
-    Kind::Ind,                                      // indirect word
-    Kind::Hash,                                     // element x word
-    Kind::Sparse,                                   // numeric run
-    Kind::Hash,                                     // three-byte skip-gram
 ];
 // The turbo profile (levels 1-3) runs only the first NBH_TURBO models
 // (orders 2-5 + word), two mixer views and two APMs — a several-times-faster
@@ -535,15 +508,14 @@ const NBH_TURBO: usize = 5;
 // First-layer mixer inputs:
 //   order-0 + order-1 dual counters (2 each)
 // + NBH bit-history models * 2 (state map + direct state estimate)
-// + 2 match models (recent short anchor, and a far 16-byte anchor)
+// + 1 match model
 // + 1 bias
-const NIN: usize = 4 + NBH * 2 + 3;
+const NIN: usize = 4 + NBH * 2 + 2;
 // Weight rows are padded to a multiple of 8 lanes for the SIMD mixer; the pad
 // inputs are always zero, so they contribute nothing and learn nothing.
 const NINP: usize = (NIN + 7) & !7;
 const BH_IN: usize = 4; // first bit-history input index
 const MATCH_IN: usize = BH_IN + NBH * 2;
-const MATCH_FAR_IN: usize = MATCH_IN + 1;
 const BIAS_IN: usize = NIN - 1;
 
 
@@ -814,10 +786,6 @@ pub struct Predictor {
     indt: Vec<u8>, // per-element: the byte that last followed this element context
     indt_mask: u32,
     indt_idx: usize,
-    indw: Vec<u8>, // per-word-prefix: the byte that last followed it
-    indw_mask: u32,
-    indw_idx: usize,
-    digits: u32,   // length of the digit run ending at the previous byte
 
     // Bit-history models: nibble-bucketed state tables + per-model state maps.
     bh: Vec<BhTable>,            // NBH tables
@@ -848,11 +816,6 @@ pub struct Predictor {
     match_ptr: usize,
     match_len: u32,
     match_byte: i32, // predicted next byte, or -1 if no active match
-    // Second model, anchored on a 16-byte suffix and tracked independently.
-    match_table_far: Vec<u32>,
-    match_ptr_far: usize,
-    match_len_far: u32,
-    match_byte_far: i32,
 
     // Two-speed coding state. fast_mode is fixed per byte (at next_byte);
     // fast_p is a tiny SSE keyed by (match-length bucket, bit position,
@@ -977,10 +940,6 @@ impl Predictor {
             indt: vec![0u8; 1 << ind3_bits],
             indt_mask: (1u32 << ind3_bits) - 1,
             indt_idx: 0,
-            indw: vec![0u8; 1 << ind3_bits],
-            indw_mask: (1u32 << ind3_bits) - 1,
-            indw_idx: 0,
-            digits: 0,
             ind2: vec![0u8; 1 << 16],
             ind3: vec![0u8; 1 << ind3_bits],
             ind4: vec![0u8; 1 << ind4_bits],
@@ -1012,10 +971,6 @@ impl Predictor {
             match_ptr: 0,
             match_len: 0,
             match_byte: -1,
-            match_table_far: vec![MATCH_EMPTY; msize],
-            match_ptr_far: 0,
-            match_len_far: 0,
-            match_byte_far: -1,
             fast_len: tunable("CPGC_FAST_LEN", FAST_LEN as i32).max(1) as u32,
             fast_mode: false,
             fast_state: 0,
@@ -1154,10 +1109,8 @@ impl Predictor {
             self.tx[BH_IN + k * 2 + 1] = st_direct[s as usize] as i32;
         }
 
-        // --- match models --------------------------------------------------
+        // --- match model -------------------------------------------------
         self.tx[MATCH_IN] = self.match_prediction(c0);
-        self.tx[MATCH_FAR_IN] =
-            Self::match_opinion(c0, self.match_byte_far, self.match_len_far);
 
         // --- bias --------------------------------------------------------
         self.tx[BIAS_IN] = 256;
@@ -1251,29 +1204,25 @@ impl Predictor {
         }
     }
 
-    /// Stretched prediction from the primary match model.
+    /// Stretched prediction from the match model for the current partial byte.
+    /// Zero — no opinion — when there is no live match, or when the bits coded
+    /// so far have already contradicted it.
     #[inline]
     fn match_prediction(&self, c0: u32) -> i32 {
-        Self::match_opinion(c0, self.match_byte, self.match_len)
-    }
-
-    /// Stretched opinion of a match model predicting `byte` after `len` bytes
-    /// of agreement. Zero — no opinion — when there is no live match, or when
-    /// the bits coded so far have already contradicted it.
-    #[inline]
-    fn match_opinion(c0: u32, byte: i32, len: u32) -> i32 {
-        if byte < 0 {
+        if self.match_byte < 0 {
             return 0;
         }
-        let mp = byte as u32;
+        let mp = self.match_byte as u32;
         let bits_seen = 31 - c0.leading_zeros(); // 0..7
         // The bits already coded must be a prefix of the predicted byte.
         let coded = c0 - (1 << bits_seen);
-        if coded != mp >> (8 - bits_seen) {
-            return 0; // contradicted within this byte
+        let expect = mp >> (8 - bits_seen);
+        if coded != expect {
+            return 0; // match contradicted within this byte
         }
-        let conf = (400 + (len.min(28) as i32) * 58).min(2000);
-        if (mp >> (7 - bits_seen)) & 1 == 1 {
+        let predicted_bit = (mp >> (7 - bits_seen)) & 1;
+        let conf = (400 + (self.match_len.min(28) as i32) * 58).min(2000);
+        if predicted_bit == 1 {
             conf
         } else {
             -conf
@@ -1437,36 +1386,6 @@ impl Predictor {
             -1
         };
 
-        // --- far match model ------------------------------------------------
-        if self.match_byte_far == byte as i32 && self.match_len_far > 0 {
-            self.match_len_far += 1;
-            self.match_ptr_far += 1;
-        } else {
-            self.match_len_far = 0;
-        }
-        if pos >= MATCH_MIN_FAR {
-            let h = (self.suffix_hash_n(MATCH_MIN_FAR) & self.match_mask) as usize;
-            let cand = self.match_table_far[h];
-            self.match_table_far[h] = pos as u32;
-            if self.match_len_far == 0 && cand != MATCH_EMPTY && (cand as usize) < pos {
-                let c = cand as usize;
-                let max = c.min(pos);
-                let mut l = 0usize;
-                while l < max && self.buf[c - 1 - l] == self.buf[pos - 1 - l] && l < 0xffff {
-                    l += 1;
-                }
-                if l >= MATCH_MIN_FAR {
-                    self.match_ptr_far = c;
-                    self.match_len_far = l as u32;
-                }
-            }
-        }
-        self.match_byte_far = if self.match_len_far > 0 && self.match_ptr_far < self.buf.len() {
-            self.buf[self.match_ptr_far] as i32
-        } else {
-            -1
-        };
-
         // Two-speed switch for the upcoming byte: deep inside a verified
         // match, code it on the fast path. Both sides compute this from the
         // same decoded history, so the choice never needs to be signalled.
@@ -1480,8 +1399,6 @@ impl Predictor {
         self.ind3[self.ind3_idx] = byte;
         self.ind4[self.ind4_idx] = byte;
         self.indt[self.indt_idx] = byte;
-        self.indw[self.indw_idx] = byte;
-        self.digits = if byte.is_ascii_digit() { self.digits + 1 } else { 0 };
 
         // --- markup state -------------------------------------------------
         self.update_markup(byte);
@@ -1612,30 +1529,6 @@ impl Predictor {
                 .wrapping_add(self.word_hash)
                 .wrapping_mul(PR2)
                 ^ 0x3C3C_A5A5;
-
-            // --- second round ---------------------------------------------
-            let ex = mk + NMARKUP;
-            self.indw_idx = (self.word_hash.wrapping_mul(PR1) & self.indw_mask) as usize;
-            let bw = self.indw[self.indw_idx];
-            self.bh_base[ex] =
-                hash_ctx(&[bw, self.hist[0]], 103) ^ self.word_hash.wrapping_mul(PR2);
-            self.bh_base[ex + 1] = self
-                .tag_hash
-                .wrapping_mul(PR1)
-                .wrapping_add(self.word_hash)
-                .wrapping_mul(PR2)
-                ^ 0x7788_99AA;
-            self.bh_base[ex + 2] = hash_ctx(
-                &[
-                    self.digits.min(15) as u8,
-                    self.hist[0],
-                    self.hist[1],
-                    self.tag_hash as u8,
-                ],
-                107,
-            );
-            self.bh_base[ex + 3] =
-                hash_ctx(&[self.hist[0], self.hist[2], self.hist[4]], 109);
         }
 
         // First-layer `wc` / `we` selections: hashed order-3 and order-6,

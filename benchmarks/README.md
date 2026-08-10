@@ -234,6 +234,28 @@ Available: `CPGC_MIX_LR`, `CPGC_MIX_ROWS`, `CPGC_NBH`, `CPGC_WAYS`,
 `CPGC_SM_DEPTH`, `CPGC_FAST_LEN`. The feature is off in release builds, so the
 shipped bitstream never depends on the environment.
 
+**Measure at the segment size you ship, not on a slice.** This has now bitten
+twice, in two unrelated places, and both times the slice pointed the wrong way.
+
+The second case was a round of five extra models — indirect word, element x
+word, numeric run, a three-byte skip-gram, and a second match model anchored on
+a 16-byte suffix. On the first 16 MiB of enwik9 they were collectively worth
+-0.18%, every one of them positive. On the 256 MiB segment level 9 actually
+runs, the same five came out **+0.85% worse** (46,372,935 against 45,980,493).
+They were reverted.
+
+The likely mechanism is worth knowing before adding models: every input widens
+the first-layer weight rows, and the mixer has to learn to suppress the ones
+that say nothing. On a short segment the tables are far larger than the context
+population, so a weak model costs almost nothing and its occasional hits are
+free. On a long one the mixer's own capacity is the scarce resource, and
+diluting it costs more than a marginal model returns. A model has to be *good*,
+not merely non-negative, to survive at level 9.
+
+So: screen on 16 MiB by all means, but confirm anything you intend to keep on a
+256 MiB segment before believing it. A screen run is 3 minutes and a
+confirmation is 35.
+
 **One warning from experience.** `CPGC_MIX_LR` is the mixer learning rate, and
 its right value falls as the segment grows — 4 for segments up to 64 MiB, 3
 above. Tuning it on small slices and applying the result to large segments costs
