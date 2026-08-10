@@ -1,6 +1,6 @@
 //! Top-level compress / decompress orchestration.
 //!
-//! ## File Format (VERSION 13)
+//! ## File Format (VERSION 14)
 //!
 //! ```text
 //! [0..4]                      magic: "CPGC"
@@ -39,7 +39,7 @@ use crate::checksum::crc32;
 use crate::transform::search::{find_best_transform, CANDIDATES};
 
 const MAGIC: &[u8; 4] = b"CPGC";
-const VERSION: u8 = 13;
+const VERSION: u8 = 14;
 /// Smallest possible header: magic+ver+flags+orig_len+crc32+n_blocks+passthrough_len.
 const HEADER_MIN: usize = 4 + 1 + 1 + 8 + 4 + 4 + 4;
 const TAG_NORMAL: u8 = 0x00;

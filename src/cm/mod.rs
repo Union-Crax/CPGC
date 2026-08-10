@@ -154,6 +154,29 @@ pub fn seg_size_for_level(level: u8) -> usize {
     1usize << bits
 }
 
+/// Does this segment look like prose rather than binary?
+///
+/// Only the encoder decides; the answer travels in the payload's profile byte,
+/// so the decoder never re-derives it and the two can never disagree. It gates
+/// the stride models, which are for fixed-period binary data and measurably
+/// negative on text.
+fn looks_texty(data: &[u8]) -> bool {
+    // A sample is enough, and bounds the cost on a 256 MiB segment.
+    let step = (data.len() / 65536).max(1);
+    let mut textish = 0usize;
+    let mut total = 0usize;
+    let mut i = 0;
+    while i < data.len() {
+        let b = data[i];
+        if b.is_ascii_graphic() || b == b' ' || b == b'\n' || b == b'\r' || b == b'\t' {
+            textish += 1;
+        }
+        total += 1;
+        i += step;
+    }
+    total > 0 && textish * 100 / total >= 95
+}
+
 /// Whether the word-dictionary transform is forced on above level 3. The
 /// default is off — the full model was measured to extract more from raw
 /// characters than from tokens — and this exists so that judgement can be
@@ -326,13 +349,16 @@ fn encode_framed(
     // the payload's u32 field.
     let seg_size = seg_size.max(1).min(data.len().max(1)).min(MAX_SEG);
     let mem = if turbo { predictor::MEM_STD } else { mem };
+    // One decision for the whole stream, so every segment agrees and the flag
+    // costs a single bit in the header rather than one per segment.
+    let text = !turbo && looks_texty(data);
 
     // Compress each segment independently, in parallel. A cancelled segment
     // yields `None`, which collapses the whole result to `None`.
     let workers = max_workers(seg_size.min(data.len()), turbo, mem);
     let segments: Option<Vec<Vec<u8>>> = with_workers(workers, || {
         data.par_chunks(seg_size)
-            .map(|chunk| encode_segment(chunk, turbo, mem, ctrl))
+            .map(|chunk| encode_segment(chunk, turbo, mem, text, ctrl))
             .collect()
     });
     let segments = segments?;
@@ -343,13 +369,16 @@ fn encode_framed(
     let mut out = Vec::with_capacity(header + body);
     out.extend_from_slice(&(seg_size as u32).to_le_bytes());
     out.extend_from_slice(&(n_seg as u32).to_le_bytes());
-    out.push(match (turbo, mem) {
-        (true, _) => 1,
+    // Profile byte: low nibble is the model/memory profile, bit 4 records the
+    // text decision. Decoding never re-derives either.
+    let profile = match (turbo, mem) {
+        (true, _) => 1u8,
         (false, predictor::MEM_BIG) => 2,
         (false, predictor::MEM_PLUS) => 3,
         (false, predictor::MEM_HUGE) => 4,
         (false, _) => 0,
-    });
+    } | if text { 0x10 } else { 0 };
+    out.push(profile);
     for s in &segments {
         out.extend_from_slice(&(s.len() as u32).to_le_bytes());
     }
@@ -365,8 +394,9 @@ fn decode_framed(payload: &[u8], n: usize, ctrl: &Control) -> Option<Vec<u8>> {
     }
     let seg_size = (u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize).max(1);
     let n_seg = u32::from_le_bytes(payload[4..8].try_into().unwrap()) as usize;
-    let turbo = payload[8] == 1;
-    let mem = match payload[8] {
+    let text = payload[8] & 0x10 != 0;
+    let turbo = payload[8] & 0x0f == 1;
+    let mem = match payload[8] & 0x0f {
         2 => predictor::MEM_BIG,
         3 => predictor::MEM_PLUS,
         4 => predictor::MEM_HUGE,
@@ -394,7 +424,7 @@ fn decode_framed(payload: &[u8], n: usize, ctrl: &Control) -> Option<Vec<u8>> {
     let workers = max_workers(seg_size.min(n), turbo, mem);
     let parts: Option<Vec<Vec<u8>>> = with_workers(workers, || {
         jobs.par_iter()
-            .map(|&(p, len)| decode_segment(p, len, turbo, mem, ctrl))
+            .map(|&(p, len)| decode_segment(p, len, turbo, mem, text, ctrl))
             .collect()
     });
     let mut parts = parts?;
@@ -416,7 +446,7 @@ fn decode_framed(payload: &[u8], n: usize, ctrl: &Control) -> Option<Vec<u8>> {
 /// size every MiB (used to localise ratio regressions; not part of the API).
 #[doc(hidden)]
 pub fn probe_encode(data: &[u8], mem: u8) {
-    let mut model = Predictor::new(data.len(), false, mem);
+    let mut model = Predictor::new(data.len(), false, mem, looks_texty(data));
     let mut enc = coder::Encoder::new();
     let mut last = 0usize;
     for (i, &byte) in data.iter().enumerate() {
@@ -441,8 +471,8 @@ pub fn probe_encode(data: &[u8], mem: u8) {
 }
 
 /// Compress a single segment (no framing). Returns `None` if cancelled.
-fn encode_segment(data: &[u8], turbo: bool, mem: u8, ctrl: &Control) -> Option<Vec<u8>> {
-    let mut model = Predictor::new(data.len(), turbo, mem);
+fn encode_segment(data: &[u8], turbo: bool, mem: u8, text: bool, ctrl: &Control) -> Option<Vec<u8>> {
+    let mut model = Predictor::new(data.len(), turbo, mem, text);
     let mut enc = Encoder::new();
     let mut since_check = 0usize;
     for &byte in data {
@@ -468,8 +498,8 @@ fn encode_segment(data: &[u8], turbo: bool, mem: u8, ctrl: &Control) -> Option<V
 }
 
 /// Decode a single segment of exactly `n` bytes. Returns `None` if cancelled.
-fn decode_segment(payload: &[u8], n: usize, turbo: bool, mem: u8, ctrl: &Control) -> Option<Vec<u8>> {
-    let mut model = Predictor::new(n, turbo, mem);
+fn decode_segment(payload: &[u8], n: usize, turbo: bool, mem: u8, text: bool, ctrl: &Control) -> Option<Vec<u8>> {
+    let mut model = Predictor::new(n, turbo, mem, text);
     let mut dec = Decoder::new(payload);
     let mut out = Vec::with_capacity(n);
     let mut since_check = 0usize;

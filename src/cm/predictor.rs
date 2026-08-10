@@ -474,6 +474,14 @@ const NTEXT: usize = 5; // order-8, order-10, order-12, order-16, case-folded or
 //     approximates.
 const NMARKUP: usize = 4;
 const NBH: usize = NHASH + NSPARSE + NSTRIDE + NIND + NTEXT + NMARKUP; // 30 models
+/// Index of the first stride model. The four stride models predict from a
+/// fixed lane of previous samples — 16-bit audio, RGB pixels, fixed-width
+/// records — and on prose they have nothing to say. The mixer cannot fully
+/// ignore them: their weights wander on noise, and muting them on a 256 MiB
+/// segment of enwik9 is worth 0.075%. So text drops them outright, which also
+/// returns their tables. Muting the single-byte sparse models as well *costs*
+/// 0.042%, so this is specific to fixed-period contexts, not pruning at large.
+const STRIDE_FIRST: usize = NHASH + NSPARSE;
 
 // Per-model table kind, indexed like `bh_base`: how big a hash table the
 // model's context population deserves.
@@ -867,7 +875,7 @@ impl Predictor {
     /// `turbo` selects the reduced low-level profile; `mem` selects the
     /// memory profile (MEM_STD / MEM_BIG / MEM_PLUS). Both change the
     /// bitstream, so the codec records them in the payload header.
-    pub fn new(n: usize, turbo: bool, mem: u8) -> Self {
+    pub fn new(n: usize, turbo: bool, mem: u8, text: bool) -> Self {
         let _ = squash(0);
         let _ = stretch(2048);
         let _ = st_direct_tbl();
@@ -954,10 +962,26 @@ impl Predictor {
             ind3_idx: 0,
             ind4_idx: 0,
             bh: (0..nbh)
-                .map(|k| BhTable::new(model_bits(k, n, mem), ways))
+                .map(|k| {
+                    let stride = text
+                        && !turbo
+                        && (STRIDE_FIRST..STRIDE_FIRST + NSTRIDE).contains(&k);
+                    // A muted model is never read, so give it the smallest
+                    // legal table rather than its full allocation.
+                    let bits = if stride { 11 } else { model_bits(k, n, mem) };
+                    BhTable::new(bits, ways)
+                })
                 .collect(),
             bh_sm: vec![sm_init(); nbh],
-            muted: tunable("CPGC_MUTE", 0) as u32,
+            muted: {
+                let mut m = tunable("CPGC_MUTE", 0) as u32;
+                if text && !turbo {
+                    for k in STRIDE_FIRST..STRIDE_FIRST + NSTRIDE {
+                        m |= 1 << k;
+                    }
+                }
+                m
+            },
             nbh,
             turbo,
             mix_lr: tunable("CPGC_MIX_LR", mix_lr_for(n, turbo)),
