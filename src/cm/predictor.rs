@@ -266,7 +266,7 @@ const RATE16: [u16; CNT_MAX + 1] = {
 
 /// Advance a packed (n0, n1) state by one observed bit.
 #[inline]
-fn state_next(s: u8, bit: i32) -> u8 {
+fn state_next_counts(s: u8, bit: i32) -> u8 {
     let mut n0 = s >> 4;
     let mut n1 = s & 15;
     if bit != 0 {
@@ -283,15 +283,56 @@ fn state_next(s: u8, bit: i32) -> u8 {
     (n0 << 4) | n1
 }
 
+/// Advance a state that spends two of its eight bits on *recency*.
+///
+/// The count-only packing above cannot tell a context that has just flipped
+/// from one that flipped a hundred visits ago — both are the same (n0, n1). On
+/// text that difference is exactly what says whether the run continues, so
+/// this trades count resolution for it: three bits each of n0 and n1 (capped
+/// at 7 rather than 15) and two bits holding the last two observed bits.
+///
+/// Capping the counts lower costs less than it sounds like. The state map
+/// *learns* what each state predicts, and everything above about seven
+/// observations is already "strong evidence" — the count-adaptive rate inside
+/// the map handles convergence from there. What it could not learn before is
+/// which way the context has been leaning lately.
+#[inline]
+fn state_next_recency(s: u8, bit: i32) -> u8 {
+    let mut n0 = s >> 5;
+    let mut n1 = (s >> 2) & 7;
+    let h = s & 3;
+    if bit != 0 {
+        n1 = (n1 + 1).min(7);
+        if n0 > 2 {
+            n0 = (n0 >> 1) + 1;
+        }
+    } else {
+        n0 = (n0 + 1).min(7);
+        if n1 > 2 {
+            n1 = (n1 >> 1) + 1;
+        }
+    }
+    (n0 << 5) | (n1 << 2) | (((h << 1) | bit as u8) & 3)
+}
+
+/// Counts encoded by a state, under whichever packing is active.
+#[inline]
+fn state_counts(s: u8, recency: bool) -> (f64, f64) {
+    if recency {
+        ((s >> 5) as f64, ((s >> 2) & 7) as f64)
+    } else {
+        ((s >> 4) as f64, (s & 15) as f64)
+    }
+}
+
 /// Closed-form stretched estimate per state: Krichevsky–Trofimov
 /// `p = (2*n1 + 1) / (2*n0 + 2*n1 + 2)`, stretched into the logistic domain.
-fn st_direct_tbl() -> &'static [i16; 256] {
-    static T: OnceLock<[i16; 256]> = OnceLock::new();
-    T.get_or_init(|| {
+fn st_direct_tbl(recency: bool) -> &'static [i16; 256] {
+    static T: [OnceLock<[i16; 256]>; 2] = [OnceLock::new(), OnceLock::new()];
+    T[recency as usize].get_or_init(|| {
         let mut t = [0i16; 256];
         for (s, slot) in t.iter_mut().enumerate() {
-            let n0 = (s >> 4) as f64;
-            let n1 = (s & 15) as f64;
+            let (n0, n1) = state_counts(s as u8, recency);
             let p = (2.0 * n1 + 1.0) / (2.0 * n0 + 2.0 * n1 + 2.0);
             let p12 = (p * 4096.0).round().clamp(1.0, 4095.0) as i32;
             *slot = stretch(p12) as i16;
@@ -333,12 +374,10 @@ const SM_SIZE: usize = 256 * SM_DEPTHS;
 /// A fresh state map, with every entry seeded from its state's closed-form
 /// estimate rather than 0.5 — a brand-new context predicts sensibly from its
 /// very first visit, and the count-adaptive rate then refines from there.
-fn sm_init() -> Vec<SmEntry> {
+fn sm_init(recency: bool) -> Vec<SmEntry> {
     let mut t = vec![SmEntry { p: 32768, cnt: 0 }; SM_SIZE];
     for (i, e) in t.iter_mut().enumerate() {
-        let s = i & 255;
-        let n0 = (s >> 4) as f64;
-        let n1 = (s & 15) as f64;
+        let (n0, n1) = state_counts((i & 255) as u8, recency);
         let p = (2.0 * n1 + 1.0) / (2.0 * n0 + 2.0 * n1 + 2.0);
         e.p = (p * 65536.0).round().clamp(1.0, 65535.0) as u16;
     }
@@ -816,6 +855,7 @@ pub struct Predictor {
     mix2_shift: usize, // 2 when the second layer sees both previous classes
     mix2_mask: usize,
     sm_planes: usize, // 1 = one shared state map, SM_DEPTHS = one per depth
+    recency: bool,    // state packing carries the last two bits
 
     // Partial byte: starts at 1, accumulates coded bits.
     c0: u32,
@@ -876,10 +916,13 @@ impl Predictor {
     /// memory profile (MEM_STD / MEM_BIG / MEM_PLUS). Both change the
     /// bitstream, so the codec records them in the payload header.
     pub fn new(n: usize, turbo: bool, mem: u8, text: bool) -> Self {
+        // Off by default until measured: with this 0 the packing, the direct
+        // estimate and the state-map seeding are all bit-identical to the
+        // counts-only design, so committing it changes nothing.
+        let recency = tunable("CPGC_RECENCY", 0) != 0;
         let _ = squash(0);
         let _ = stretch(2048);
-        let _ = st_direct_tbl();
-
+        let _ = st_direct_tbl(recency);
         let nbh = if turbo {
             NBH_TURBO
         } else {
@@ -972,7 +1015,7 @@ impl Predictor {
                     BhTable::new(bits, ways)
                 })
                 .collect(),
-            bh_sm: vec![sm_init(); nbh],
+            bh_sm: vec![sm_init(recency); nbh],
             muted: {
                 let mut m = tunable("CPGC_MUTE", 0) as u32;
                 if text && !turbo {
@@ -988,6 +1031,7 @@ impl Predictor {
             mix2_shift: if tunable("CPGC_MIX2CTX", 1) != 0 { 2 } else { 0 },
             mix2_mask: if tunable("CPGC_MIX2CTX", 1) != 0 { 3 } else { 0 },
             sm_planes: if tunable("CPGC_SM_DEPTH", 1) != 0 { SM_DEPTHS } else { 1 },
+            recency,
             bh_base: [0; NBH],
             bh_off: [1; NBH],
             bh_state: [0; NBH],
@@ -1130,7 +1174,7 @@ impl Predictor {
         // --- bit-history models: state map + direct state estimate -------
         let sidx = (self.nib_path - 1) as usize;
         let smp = self.sm_plane();
-        let st_direct = st_direct_tbl();
+        let st_direct = st_direct_tbl(self.recency);
         for k in 0..self.nbh {
             let s = self.bh[k].t[self.bh_off[k] + sidx];
             self.bh_state[k] = s;
@@ -1292,7 +1336,11 @@ impl Predictor {
         for k in 0..self.nbh {
             let s = self.bh_state[k];
             self.bh_sm[k][smp + s as usize].update(bit);
-            self.bh[k].t[self.bh_off[k] + sidx] = state_next(s, bit);
+            self.bh[k].t[self.bh_off[k] + sidx] = if self.recency {
+                state_next_recency(s, bit)
+            } else {
+                state_next_counts(s, bit)
+            };
         }
         self.nib_path = (self.nib_path << 1) | (bit as u32);
 
