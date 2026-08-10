@@ -193,6 +193,10 @@ const MODEL_CAP: [u32; NBH] = [
     19,             // bracket nesting: delimiter x depth x previous byte
     CAP_OPEN,       // line shape
     31,             // word trigram
+    CAP_OPEN,       // indirect word
+    31,             // element x word
+    21,             // numeric run: element x run length x last digits
+    CAP_OPEN,       // three-byte skip-gram
 ];
 
 /// Roughly how many bytes one [`Predictor`] over an `n`-byte segment will
@@ -473,7 +477,19 @@ const NTEXT: usize = 5; // order-8, order-10, order-12, order-16, case-folded or
 //     prefix, a genuine language model context that the word-pair model only
 //     approximates.
 const NMARKUP: usize = 4;
-const NBH: usize = NHASH + NSPARSE + NSTRIDE + NIND + NTEXT + NMARKUP; // 30 models
+// A second round aimed at what a Wikipedia dump actually contains, rather than
+// at text in general:
+//   * indirect word — the byte that last followed this word *prefix*, a
+//     word-completion cue the word model itself cannot express;
+//   * element x word — `<title>` vocabulary is not body vocabulary, and neither
+//     the element model nor the word model sees the product;
+//   * numeric run — page ids, revision ids and ISO timestamps are a large
+//     fraction of the file, and a digit inside a run is predicted by how far
+//     into the run it is and which element encloses it;
+//   * a three-byte skip-gram, reaching past the two-byte sparse contexts.
+const NEXTRA: usize = 4;
+const NBH: usize =
+    NHASH + NSPARSE + NSTRIDE + NIND + NTEXT + NMARKUP + NEXTRA; // 34 models
 
 // Per-model table kind, indexed like `bh_base`: how big a hash table the
 // model's context population deserves.
@@ -499,6 +515,10 @@ const MODEL_KIND: [Kind; NBH] = [
     Kind::Sparse,                                   // bracket nesting
     Kind::Sparse,                                   // line shape
     Kind::Hash,                                     // word trigram
+    Kind::Ind,                                      // indirect word
+    Kind::Hash,                                     // element x word
+    Kind::Sparse,                                   // numeric run
+    Kind::Hash,                                     // three-byte skip-gram
 ];
 // The turbo profile (levels 1-3) runs only the first NBH_TURBO models
 // (orders 2-5 + word), two mixer views and two APMs — a several-times-faster
@@ -786,6 +806,10 @@ pub struct Predictor {
     indt: Vec<u8>, // per-element: the byte that last followed this element context
     indt_mask: u32,
     indt_idx: usize,
+    indw: Vec<u8>, // per-word-prefix: the byte that last followed it
+    indw_mask: u32,
+    indw_idx: usize,
+    digits: u32,   // length of the digit run ending at the previous byte
 
     // Bit-history models: nibble-bucketed state tables + per-model state maps.
     bh: Vec<BhTable>,            // NBH tables
@@ -940,6 +964,10 @@ impl Predictor {
             indt: vec![0u8; 1 << ind3_bits],
             indt_mask: (1u32 << ind3_bits) - 1,
             indt_idx: 0,
+            indw: vec![0u8; 1 << ind3_bits],
+            indw_mask: (1u32 << ind3_bits) - 1,
+            indw_idx: 0,
+            digits: 0,
             ind2: vec![0u8; 1 << 16],
             ind3: vec![0u8; 1 << ind3_bits],
             ind4: vec![0u8; 1 << ind4_bits],
@@ -1399,6 +1427,8 @@ impl Predictor {
         self.ind3[self.ind3_idx] = byte;
         self.ind4[self.ind4_idx] = byte;
         self.indt[self.indt_idx] = byte;
+        self.indw[self.indw_idx] = byte;
+        self.digits = if byte.is_ascii_digit() { self.digits + 1 } else { 0 };
 
         // --- markup state -------------------------------------------------
         self.update_markup(byte);
@@ -1529,6 +1559,30 @@ impl Predictor {
                 .wrapping_add(self.word_hash)
                 .wrapping_mul(PR2)
                 ^ 0x3C3C_A5A5;
+
+            // --- second round ---------------------------------------------
+            let ex = mk + NMARKUP;
+            self.indw_idx = (self.word_hash.wrapping_mul(PR1) & self.indw_mask) as usize;
+            let bw = self.indw[self.indw_idx];
+            self.bh_base[ex] =
+                hash_ctx(&[bw, self.hist[0]], 103) ^ self.word_hash.wrapping_mul(PR2);
+            self.bh_base[ex + 1] = self
+                .tag_hash
+                .wrapping_mul(PR1)
+                .wrapping_add(self.word_hash)
+                .wrapping_mul(PR2)
+                ^ 0x7788_99AA;
+            self.bh_base[ex + 2] = hash_ctx(
+                &[
+                    self.digits.min(15) as u8,
+                    self.hist[0],
+                    self.hist[1],
+                    self.tag_hash as u8,
+                ],
+                107,
+            );
+            self.bh_base[ex + 3] =
+                hash_ctx(&[self.hist[0], self.hist[2], self.hist[4]], 109);
         }
 
         // First-layer `wc` / `we` selections: hashed order-3 and order-6,

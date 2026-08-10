@@ -90,7 +90,7 @@ pub fn compress_with_control(input: &[u8], level: u8, ctrl: &cm::Control) -> Res
     // model recovers less of the structure the tokens erase, and the 40%
     // stream shrinkage is a direct speedup). The full model extracts more
     // from raw characters than from tokens, so levels >= 4 skip it.
-    let dict_stream = if level <= 3 {
+    let dict_stream = if level <= 3 || crate::cm::dict_forced() {
         crate::transform::textdict::apply(input)
     } else {
         None

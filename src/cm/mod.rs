@@ -154,6 +154,20 @@ pub fn seg_size_for_level(level: u8) -> usize {
     1usize << bits
 }
 
+/// Whether the word-dictionary transform is forced on above level 3. The
+/// default is off — the full model was measured to extract more from raw
+/// characters than from tokens — and this exists so that judgement can be
+/// re-measured as the model changes, rather than taken on trust.
+pub fn dict_forced() -> bool {
+    #[cfg(feature = "tune")]
+    {
+        if let Ok(v) = std::env::var("CPGC_DICT") {
+            return v != "0";
+        }
+    }
+    false
+}
+
 /// Largest segment the payload's u32 segment-size field can describe.
 pub const MAX_SEG: usize = 1 << 31;
 
