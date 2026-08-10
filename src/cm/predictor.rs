@@ -235,8 +235,6 @@ pub const MEM_PLUS: u8 = 2; // level 8: up to 2^24 buckets, 2^25 match slots
 pub const MEM_HUGE: u8 = 3; // level 9: up to 2^25 buckets, 2^26 match slots
 
 const RATE_FAST: i32 = 3;
-/// Adaptation shift for the fast state map (see `SmEntry::update_fast`).
-const RATE_SM_FAST: i32 = 5;
 
 // Count-adaptive learning rate, as a 16-bit fraction:
 // `RATE16[cnt] == round(2^16 / (cnt + 2))`. A freshly seen context (cnt == 0)
@@ -311,17 +309,6 @@ struct SmEntry {
 }
 
 impl SmEntry {
-    /// Adapt at a fixed fast rate instead of the count-adaptive schedule. The
-    /// slow map converges to a context's stationary probability; this one
-    /// tracks where it has been *lately*, which is a different and largely
-    /// uncorrelated opinion about the same state.
-    #[inline]
-    fn update_fast(&mut self, bit: i32) {
-        let target = bit << 16;
-        let p = self.p as i32;
-        self.p = (p + ((target - p) >> RATE_SM_FAST)) as u16;
-    }
-
     #[inline]
     fn update(&mut self, bit: i32) {
         let target = bit << 16;
@@ -803,11 +790,11 @@ pub struct Predictor {
     // Bit-history models: nibble-bucketed state tables + per-model state maps.
     bh: Vec<BhTable>,            // NBH tables
     bh_sm: Vec<Vec<SmEntry>>,    // NBH state maps, SM_DEPTHS planes each
-    // Second opinion per model, occupying the mixer input that used to carry a
-    // fixed closed-form estimate. `sm2_mode` selects which: 0 = nothing,
-    // 1 = the closed-form estimate, 2 = a fast-adapting state map.
-    bh_sm2: Vec<Vec<SmEntry>>,
-    sm2_mode: i32,
+    /// Bit `k` set means model `k`'s two mixer inputs are held at zero, so it
+    /// contributes nothing and its weights never move. Used to ask whether a
+    /// model is carrying its own weight: on a long segment the mixer's width is
+    /// the scarce resource, and an input that says nothing is not free.
+    muted: u32,
     bh_base: [u32; NBH],         // per-byte context hashes
     bh_off: [usize; NBH],        // resolved bucket slot-array offsets
     bh_state: [u8; NBH],         // states read by predict(), for update()
@@ -970,8 +957,7 @@ impl Predictor {
                 .map(|k| BhTable::new(model_bits(k, n, mem), ways))
                 .collect(),
             bh_sm: vec![sm_init(); nbh],
-            bh_sm2: vec![sm_init(); nbh],
-            sm2_mode: tunable("CPGC_SM2", 1),
+            muted: tunable("CPGC_MUTE", 0) as u32,
             nbh,
             turbo,
             mix_lr: tunable("CPGC_MIX_LR", mix_lr_for(n, turbo)),
@@ -1124,13 +1110,14 @@ impl Predictor {
         for k in 0..self.nbh {
             let s = self.bh[k].t[self.bh_off[k] + sidx];
             self.bh_state[k] = s;
+            if self.muted >> k & 1 == 1 {
+                self.tx[BH_IN + k * 2] = 0;
+                self.tx[BH_IN + k * 2 + 1] = 0;
+                continue;
+            }
             let e = self.bh_sm[k][smp + s as usize];
             self.tx[BH_IN + k * 2] = stretch((e.p >> 4) as i32);
-            self.tx[BH_IN + k * 2 + 1] = match self.sm2_mode {
-                0 => 0,
-                2 => stretch((self.bh_sm2[k][smp + s as usize].p >> 4) as i32),
-                _ => st_direct[s as usize] as i32,
-            };
+            self.tx[BH_IN + k * 2 + 1] = st_direct[s as usize] as i32;
         }
 
         // --- match model -------------------------------------------------
@@ -1281,9 +1268,6 @@ impl Predictor {
         for k in 0..self.nbh {
             let s = self.bh_state[k];
             self.bh_sm[k][smp + s as usize].update(bit);
-            if self.sm2_mode == 2 {
-                self.bh_sm2[k][smp + s as usize].update_fast(bit);
-            }
             self.bh[k].t[self.bh_off[k] + sidx] = state_next(s, bit);
         }
         self.nib_path = (self.nib_path << 1) | (bit as u32);

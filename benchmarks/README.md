@@ -234,6 +234,34 @@ Available: `CPGC_MIX_LR`, `CPGC_MIX_ROWS`, `CPGC_NBH`, `CPGC_WAYS`,
 `CPGC_SM_DEPTH`, `CPGC_FAST_LEN`. The feature is off in release builds, so the
 shipped bitstream never depends on the environment.
 
+### What the two mixer inputs per model are worth
+
+Every bit-history model feeds the mixer twice: a learned state map, and a fixed
+closed-form (Krichevsky–Trofimov) estimate of the same packed state. The second
+looks redundant — it learns nothing — so it was tested two ways on the 256 MiB
+segment, against 45,980,493:
+
+| Second input | Compressed | vs current |
+|---|---:|---:|
+| closed-form estimate (current) | 45,980,493 | — |
+| dropped entirely | 46,221,588 | +0.52% |
+| a fast-adapting second state map | 49,340,242 | +7.31% |
+
+Both alternatives are worse, and the reasons are worth keeping.
+
+Dropping it costs half a percent, so it is carrying real information rather than
+padding. That also disposes of a tempting generalisation: after five weak models
+made things 0.85% worse, it was reasonable to think mixer *width* was itself the
+problem and pruning would help. It is not — a good input pays for its width. The
+five models failed because they were weak, not because they were extra.
+
+The fast state map is much worse, and structurally so. A state map is shared
+across *all* of a model's contexts, indexed only by the packed state and the
+nibble depth. Adapting it quickly therefore does not track "this context
+lately", it tracks whichever unrelated context happened to visit that state
+last. The count-adaptive schedule is not a tunable there; it is what makes a
+shared map meaningful at all.
+
 **Measure at the segment size you ship, not on a slice.** This has now bitten
 twice, in two unrelated places, and both times the slice pointed the wrong way.
 
