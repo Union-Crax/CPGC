@@ -90,6 +90,13 @@ const HBITS_MIN: u32 = 14;
 
 const MATCH_MIN: usize = 4; // short-hash suffix length that seeds a new match
 const MATCH_MIN_LONG: usize = 8; // long-hash suffix length (tried first)
+// A second, independent match model anchored on a much longer suffix. The
+// first model always follows the *most recent* occurrence of a short suffix,
+// which on a Wikipedia dump is usually the nearest boilerplate rather than the
+// most informative one. Anchoring separately on 16 bytes finds a different,
+// rarer continuation, and the mixer gets two long-range opinions to weigh
+// instead of one.
+const MATCH_MIN_FAR: usize = 16;
 const MATCH_EMPTY: u32 = u32::MAX;
 
 // Two-speed coding: once a verified match reaches this length, whole bytes
@@ -528,14 +535,15 @@ const NBH_TURBO: usize = 5;
 // First-layer mixer inputs:
 //   order-0 + order-1 dual counters (2 each)
 // + NBH bit-history models * 2 (state map + direct state estimate)
-// + 1 match model
+// + 2 match models (recent short anchor, and a far 16-byte anchor)
 // + 1 bias
-const NIN: usize = 4 + NBH * 2 + 2;
+const NIN: usize = 4 + NBH * 2 + 3;
 // Weight rows are padded to a multiple of 8 lanes for the SIMD mixer; the pad
 // inputs are always zero, so they contribute nothing and learn nothing.
 const NINP: usize = (NIN + 7) & !7;
 const BH_IN: usize = 4; // first bit-history input index
 const MATCH_IN: usize = BH_IN + NBH * 2;
+const MATCH_FAR_IN: usize = MATCH_IN + 1;
 const BIAS_IN: usize = NIN - 1;
 
 
@@ -840,6 +848,11 @@ pub struct Predictor {
     match_ptr: usize,
     match_len: u32,
     match_byte: i32, // predicted next byte, or -1 if no active match
+    // Second model, anchored on a 16-byte suffix and tracked independently.
+    match_table_far: Vec<u32>,
+    match_ptr_far: usize,
+    match_len_far: u32,
+    match_byte_far: i32,
 
     // Two-speed coding state. fast_mode is fixed per byte (at next_byte);
     // fast_p is a tiny SSE keyed by (match-length bucket, bit position,
@@ -999,6 +1012,10 @@ impl Predictor {
             match_ptr: 0,
             match_len: 0,
             match_byte: -1,
+            match_table_far: vec![MATCH_EMPTY; msize],
+            match_ptr_far: 0,
+            match_len_far: 0,
+            match_byte_far: -1,
             fast_len: tunable("CPGC_FAST_LEN", FAST_LEN as i32).max(1) as u32,
             fast_mode: false,
             fast_state: 0,
@@ -1137,8 +1154,10 @@ impl Predictor {
             self.tx[BH_IN + k * 2 + 1] = st_direct[s as usize] as i32;
         }
 
-        // --- match model -------------------------------------------------
+        // --- match models --------------------------------------------------
         self.tx[MATCH_IN] = self.match_prediction(c0);
+        self.tx[MATCH_FAR_IN] =
+            Self::match_opinion(c0, self.match_byte_far, self.match_len_far);
 
         // --- bias --------------------------------------------------------
         self.tx[BIAS_IN] = 256;
@@ -1232,25 +1251,29 @@ impl Predictor {
         }
     }
 
-    /// Stretched prediction from the match model for the current partial byte.
-    /// Zero — no opinion — when there is no live match, or when the bits coded
-    /// so far have already contradicted it.
+    /// Stretched prediction from the primary match model.
     #[inline]
     fn match_prediction(&self, c0: u32) -> i32 {
-        if self.match_byte < 0 {
+        Self::match_opinion(c0, self.match_byte, self.match_len)
+    }
+
+    /// Stretched opinion of a match model predicting `byte` after `len` bytes
+    /// of agreement. Zero — no opinion — when there is no live match, or when
+    /// the bits coded so far have already contradicted it.
+    #[inline]
+    fn match_opinion(c0: u32, byte: i32, len: u32) -> i32 {
+        if byte < 0 {
             return 0;
         }
-        let mp = self.match_byte as u32;
+        let mp = byte as u32;
         let bits_seen = 31 - c0.leading_zeros(); // 0..7
         // The bits already coded must be a prefix of the predicted byte.
         let coded = c0 - (1 << bits_seen);
-        let expect = mp >> (8 - bits_seen);
-        if coded != expect {
-            return 0; // match contradicted within this byte
+        if coded != mp >> (8 - bits_seen) {
+            return 0; // contradicted within this byte
         }
-        let predicted_bit = (mp >> (7 - bits_seen)) & 1;
-        let conf = (400 + (self.match_len.min(28) as i32) * 58).min(2000);
-        if predicted_bit == 1 {
+        let conf = (400 + (len.min(28) as i32) * 58).min(2000);
+        if (mp >> (7 - bits_seen)) & 1 == 1 {
             conf
         } else {
             -conf
@@ -1410,6 +1433,36 @@ impl Predictor {
         }
         self.match_byte = if self.match_len > 0 && self.match_ptr < self.buf.len() {
             self.buf[self.match_ptr] as i32
+        } else {
+            -1
+        };
+
+        // --- far match model ------------------------------------------------
+        if self.match_byte_far == byte as i32 && self.match_len_far > 0 {
+            self.match_len_far += 1;
+            self.match_ptr_far += 1;
+        } else {
+            self.match_len_far = 0;
+        }
+        if pos >= MATCH_MIN_FAR {
+            let h = (self.suffix_hash_n(MATCH_MIN_FAR) & self.match_mask) as usize;
+            let cand = self.match_table_far[h];
+            self.match_table_far[h] = pos as u32;
+            if self.match_len_far == 0 && cand != MATCH_EMPTY && (cand as usize) < pos {
+                let c = cand as usize;
+                let max = c.min(pos);
+                let mut l = 0usize;
+                while l < max && self.buf[c - 1 - l] == self.buf[pos - 1 - l] && l < 0xffff {
+                    l += 1;
+                }
+                if l >= MATCH_MIN_FAR {
+                    self.match_ptr_far = c;
+                    self.match_len_far = l as u32;
+                }
+            }
+        }
+        self.match_byte_far = if self.match_len_far > 0 && self.match_ptr_far < self.buf.len() {
+            self.buf[self.match_ptr_far] as i32
         } else {
             -1
         };
