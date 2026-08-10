@@ -291,11 +291,18 @@ fn state_next_counts(s: u8, bit: i32) -> u8 {
 /// this trades count resolution for it: three bits each of n0 and n1 (capped
 /// at 7 rather than 15) and two bits holding the last two observed bits.
 ///
-/// Capping the counts lower costs less than it sounds like. The state map
-/// *learns* what each state predicts, and everything above about seven
-/// observations is already "strong evidence" — the count-adaptive rate inside
-/// the map handles convergence from there. What it could not learn before is
-/// which way the context has been leaning lately.
+/// Measured, and the trade does not pay: on the 256 MiB segment level 9 runs
+/// this gives 46,683,826 bytes against the counts-only 45,945,868, or 1.6%
+/// worse. Count resolution past seven is worth more than knowing the last two
+/// bits — the reverse of the guess above. Kept, off by default, because it is
+/// the obvious thing to try and the next person should be able to see the
+/// number rather than re-run it.
+///
+/// If recency is worth having, it has to be *added* to the counts rather than
+/// taken out of them, which means a wider bucket: 16 bytes currently hold a
+/// checksum and fifteen states exactly. Doubling that halves the table for a
+/// given budget, and the clamp sweep says halving costs about 0.6%, so any
+/// run-information scheme has to beat that to be worth the memory.
 #[inline]
 fn state_next_recency(s: u8, bit: i32) -> u8 {
     let mut n0 = s >> 5;

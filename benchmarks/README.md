@@ -262,6 +262,27 @@ lately", it tracks whichever unrelated context happened to visit that state
 last. The count-adaptive schedule is not a tunable there; it is what makes a
 shared map meaningful at all.
 
+**Things already tried that did not work.** Each was measured on the 256 MiB
+segment level 9 runs, against 45,945,868 bytes:
+
+| Change | Result |
+|---|---:|
+| Drop the four stride models on text | **-0.075%** (kept) |
+| Raise `CAP_OPEN` 24 -> 25, +1.5 GiB/segment | -0.005% |
+| Profile clamp 2^25 -> 2^26, +6 GiB/segment | ~-0.4% projected |
+| Four extra context models + a second match model | +0.85% |
+| Word-dictionary transform at level 9 | +2.75% |
+| Second mixer input per model dropped | +0.52% |
+| Second mixer input as a fast state map | +7.31% |
+| Bit-history state carrying two recency bits | +1.61% |
+
+Two of those are worth internalising. The mixer's second input per model is a
+*fixed* closed-form estimate that learns nothing, and both attempts to improve
+it — dropping it, and replacing it with an adaptive map — made things clearly
+worse, so it is carrying real information despite looking like a placeholder.
+And the bit-history state's count resolution matters more than recency: capping
+n0/n1 at 7 to buy two bits of history costs 1.6%.
+
 **Measure at the segment size you ship, not on a slice.** This has now bitten
 twice, in two unrelated places, and both times the slice pointed the wrong way.
 
