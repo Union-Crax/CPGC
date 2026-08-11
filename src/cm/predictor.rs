@@ -1026,6 +1026,7 @@ impl Predictor {
                     let stride = text
                         && !turbo
                         && n >= STRIDE_DROP_MIN
+                        && tunable("CPGC_STRIDE_DROP", 1) != 0
                         && (STRIDE_FIRST..STRIDE_FIRST + NSTRIDE).contains(&k);
                     // A muted model is never read, so give it the smallest
                     // legal table rather than its full allocation.
@@ -1036,7 +1037,7 @@ impl Predictor {
             bh_sm: vec![sm_init(recency); nbh],
             muted: {
                 let mut m = tunable("CPGC_MUTE", 0) as u32;
-                if text && !turbo && n >= STRIDE_DROP_MIN {
+                if text && !turbo && n >= STRIDE_DROP_MIN && tunable("CPGC_STRIDE_DROP", 1) != 0 {
                     for k in STRIDE_FIRST..STRIDE_FIRST + NSTRIDE {
                         m |= 1 << k;
                     }
