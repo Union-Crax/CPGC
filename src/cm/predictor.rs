@@ -528,6 +528,16 @@ const NBH: usize = NHASH + NSPARSE + NSTRIDE + NIND + NTEXT + NMARKUP; // 30 mod
 /// returns their tables. Muting the single-byte sparse models as well *costs*
 /// 0.042%, so this is specific to fixed-period contexts, not pruning at large.
 const STRIDE_FIRST: usize = NHASH + NSPARSE;
+/// Smallest segment for which dropping the stride models pays.
+///
+/// It is a wash below this and a loss further down: measured on enwik8, levels
+/// 7 and 8 (64 MiB segments) gain 0.09% from dropping them while levels 4-6
+/// (8-32 MiB) lose 0.02-0.04%. The same size dependence shows up everywhere in
+/// this engine — a short segment has table capacity to spare, so a model that
+/// says almost nothing still costs almost nothing, and its rare hits are free.
+/// Only once the segment is long enough for mixer capacity to bind does
+/// carrying a useless model turn negative.
+const STRIDE_DROP_MIN: usize = 64 << 20;
 
 // Per-model table kind, indexed like `bh_base`: how big a hash table the
 // model's context population deserves.
@@ -1015,6 +1025,7 @@ impl Predictor {
                 .map(|k| {
                     let stride = text
                         && !turbo
+                        && n >= STRIDE_DROP_MIN
                         && (STRIDE_FIRST..STRIDE_FIRST + NSTRIDE).contains(&k);
                     // A muted model is never read, so give it the smallest
                     // legal table rather than its full allocation.
@@ -1025,7 +1036,7 @@ impl Predictor {
             bh_sm: vec![sm_init(recency); nbh],
             muted: {
                 let mut m = tunable("CPGC_MUTE", 0) as u32;
-                if text && !turbo {
+                if text && !turbo && n >= STRIDE_DROP_MIN {
                     for k in STRIDE_FIRST..STRIDE_FIRST + NSTRIDE {
                         m |= 1 << k;
                     }
