@@ -539,6 +539,24 @@ const STRIDE_FIRST: usize = NHASH + NSPARSE;
 /// carrying a useless model turn negative.
 const STRIDE_DROP_MIN: usize = 64 << 20;
 
+/// Whether text segments drop the stride models. **Off**: the idea does not
+/// survive measurement.
+///
+/// It looked good on two of four configurations — enwik8 levels 7 and 8 gain
+/// 0.092% and 0.095%, a 256 MiB slice of enwik9 gains 0.075% — but enwik8 at
+/// level 9 *loses* 0.238%, confirmed by an A/B on one binary with only this
+/// flag changing (18,165,799 dropped against 18,122,756 kept). The loss is
+/// bigger than any of the gains, and it sits between two segment sizes that
+/// both gain, so no size threshold explains it and any that fitted would be
+/// fitted to three points.
+///
+/// The mechanism stays wired through the payload's profile bit so archives
+/// written while it was on still decode, and so the question can be reopened
+/// with `CPGC_STRIDE_DROP=1` rather than rebuilt from scratch.
+pub fn stride_drop_enabled() -> bool {
+    tunable("CPGC_STRIDE_DROP", 0) != 0
+}
+
 // Per-model table kind, indexed like `bh_base`: how big a hash table the
 // model's context population deserves.
 #[derive(Clone, Copy, PartialEq)]
@@ -1026,7 +1044,7 @@ impl Predictor {
                     let stride = text
                         && !turbo
                         && n >= STRIDE_DROP_MIN
-                        && tunable("CPGC_STRIDE_DROP", 1) != 0
+                        && stride_drop_enabled()
                         && (STRIDE_FIRST..STRIDE_FIRST + NSTRIDE).contains(&k);
                     // A muted model is never read, so give it the smallest
                     // legal table rather than its full allocation.
@@ -1037,7 +1055,7 @@ impl Predictor {
             bh_sm: vec![sm_init(recency); nbh],
             muted: {
                 let mut m = tunable("CPGC_MUTE", 0) as u32;
-                if text && !turbo && n >= STRIDE_DROP_MIN && tunable("CPGC_STRIDE_DROP", 1) != 0 {
+                if text && !turbo && n >= STRIDE_DROP_MIN && stride_drop_enabled() {
                     for k in STRIDE_FIRST..STRIDE_FIRST + NSTRIDE {
                         m |= 1 << k;
                     }

@@ -184,3 +184,33 @@ fn codec_roundtrip_large_text_full_model() {
     let recovered = decompress(&compressed).expect("decompress failed");
     assert_eq!(recovered, data);
 }
+
+/// Compressing the same input twice must produce byte-identical output.
+///
+/// This did not hold: the word-dictionary transform ranked candidates with an
+/// unstable sort over `HashMap` iteration order, which Rust seeds randomly per
+/// process, so ties were settled differently on every run. Three runs over
+/// enwik8 at level 1 gave three different sizes. Levels 1-3 use that transform.
+#[test]
+fn compression_is_reproducible() {
+    // Texty and repetitive enough to build a dictionary with many ties.
+    let mut data = Vec::new();
+    for i in 0..4000 {
+        data.extend_from_slice(
+            format!(
+                "the quick brown fox {} jumps over the lazy dog {}\n\
+                 <page><title>Article {}</title><text>content here</text></page>\n",
+                i % 97,
+                i % 89,
+                i % 101
+            )
+            .as_bytes(),
+        );
+    }
+    for level in [1u8, 2, 3, 5] {
+        let a = compress(&data, level).unwrap();
+        let b = compress(&data, level).unwrap();
+        assert_eq!(a, b, "level {level} is not reproducible");
+        assert_eq!(decompress(&a).unwrap(), data, "level {level} round trip");
+    }
+}

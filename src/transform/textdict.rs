@@ -142,13 +142,27 @@ pub fn apply(data: &[u8]) -> Option<Vec<u8>> {
     if ranked.len() < 16 {
         return None; // not enough repetition to be worth a dictionary
     }
-    ranked.sort_unstable_by_key(|&(w, c)| std::cmp::Reverse((w.len() as u64 - 2) * c as u64));
+    // Ties are broken by the word bytes, not by whatever order the hash map
+    // happened to yield. Without this the dictionary — and therefore the whole
+    // output — differs from run to run: `HashMap` iteration is randomly seeded
+    // per process, the savings key has many ties, and an unstable sort settles
+    // them arbitrarily, so which words survive `truncate` and which token each
+    // gets both move. Three runs over enwik8 at level 1 gave 23,533,836,
+    // 23,530,355 and 23,529,966 bytes before this.
+    ranked.sort_unstable_by(|a, b| {
+        let sa = (a.0.len() as u64 - 2) * a.1 as u64;
+        let sb = (b.0.len() as u64 - 2) * b.1 as u64;
+        sb.cmp(&sa).then_with(|| a.0.cmp(b.0))
+    });
     ranked.truncate(capacity);
     // The single-byte tokens go to the words with the highest 1-extra-byte
     // saving (they already lead the sort in practice; re-rank to be exact).
     let head = ranked.len().min(n_single * 4);
-    ranked[..head]
-        .sort_unstable_by_key(|&(w, c)| std::cmp::Reverse((w.len() as u64 - 1) * c as u64));
+    ranked[..head].sort_unstable_by(|a, b| {
+        let sa = (a.0.len() as u64 - 1) * a.1 as u64;
+        let sb = (b.0.len() as u64 - 1) * b.1 as u64;
+        sb.cmp(&sa).then_with(|| a.0.cmp(b.0))
+    });
 
     // Single-token words keep savings order; pair-token words are sorted
     // alphabetically so that similar words share a lead byte — the coder's

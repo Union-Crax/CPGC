@@ -351,7 +351,7 @@ fn encode_framed(
     let mem = if turbo { predictor::MEM_STD } else { mem };
     // One decision for the whole stream, so every segment agrees and the flag
     // costs a single bit in the header rather than one per segment.
-    let text = !turbo && looks_texty(data);
+    let text = !turbo && predictor::stride_drop_enabled() && looks_texty(data);
 
     // Compress each segment independently, in parallel. A cancelled segment
     // yields `None`, which collapses the whole result to `None`.
